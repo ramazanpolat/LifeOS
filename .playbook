@@ -1,0 +1,10 @@
+version = "7.1.1"
+name = "lifeos"
+alias = "lifeos"
+description = "LifeOS — the Life Operating System, packaged as an isolated Claude Code playbook"
+homepage = "https://github.com/ramazanpolat/LifeOS"
+author = "Daniel Miessler (LifeOS); playbook packaging: Ramazan Polat"
+
+[source]
+repository = "https://github.com/ramazanpolat/LifeOS"
+update_script = "bin/update-playbook.sh"

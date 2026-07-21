@@ -61,3 +61,40 @@ out/
 private/
 secrets/
 credentials/
+
+# --- claude-playbook runtime (deployed by bin/deploy.ts, per-install state) ---
+# Everything below is written into the playbook config root at deploy time and is
+# per-install state — never committed. Entries are root-anchored (leading `/`) so
+# the tracked payload under LifeOS/ is untouched; bin/, .playbook, CLAUDE.md, and
+# PLAYBOOK.md also stay tracked. (node_modules/, logs/, and .DS_Store are already
+# ignored globally above, so they are not repeated here.)
+
+# Deployed payload (from LifeOS/install/ → config root)
+/settings.json
+/settings.local.json
+/hooks/
+/skills/
+/agents/
+/commands/
+/runtime/
+/USER/
+/package.json
+/bun.lock
+
+# Claude Code per-instance state
+/.claude.json*
+/.credentials.json
+/history.jsonl
+/projects/
+/todos/
+/sessions/
+/session-env/
+/shell-snapshots/
+/file-history/
+/paste-cache/
+/statsig/
+/cache/
+/plugins/
+/.last-*
+/remote-settings.json
+/policy-limits.json
