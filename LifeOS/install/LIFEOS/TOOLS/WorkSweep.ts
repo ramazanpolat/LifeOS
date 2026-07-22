@@ -452,7 +452,7 @@ async function sweepGoals(
       "Status:queued",
       "Property:internal",
       "Priority:P2",
-      "Agent:kai",
+      `Agent:${getDAName()}`,
     ], existingLabels);
     const body = [
       `## 🎯 TELOS Goal`,
@@ -523,7 +523,7 @@ async function sweepBpeCadence(
     "Status:queued",
     "Property:internal",
     "Priority:P3",
-    "Agent:kai",
+    `Agent:${getDAName()}`,
   ], existingLabels);
   const body = [
     `## 🪓 Scheduled BitterPillEngineering pass`,
