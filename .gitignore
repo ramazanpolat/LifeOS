@@ -81,9 +81,14 @@ credentials/
 /package.json
 /bun.lock
 
+# Deploy-adjacent backups (InstallSettings-style timestamped copies, manual fixes)
+/settings.json.backup-*
+
 # Claude Code per-instance state
 /.claude.json*
 /.credentials.json
+/backups/
+/teams/
 /history.jsonl
 /projects/
 /todos/

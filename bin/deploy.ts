@@ -165,6 +165,27 @@ const RULES: Rule[] = [
   //        target). BOUND-free on the subdir because a trailing `/` already
   //        anchors it to a real path segment.
   { name: "RrelH", re: /(?:\.\.\/)+(hooks|skills|agents|commands)\//g, rep: (_m, sub) => CR + "/" + sub + "/" },
+  // R6a — config-root-relative "LIFEOS/..." path strings. Upstream's two-step
+  //        idiom (`const CLAUDE = join(HOME, ".claude"); join(CLAUDE,
+  //        "LIFEOS/TOOLS")`) defeats R1–R4: the first statement rewrites to the
+  //        absolute <CR>, but the second join carries no `.claude` literal, so
+  //        the "LIFEOS/..." segment survives and resolves to <CR>/LIFEOS —
+  //        which on a case-insensitive FS IS the tracked LifeOS/ payload dir
+  //        (MemoryHealthCheck then reports its required tools "missing" and
+  //        writes its health log INTO the payload tree). Any quoted path
+  //        starting with `LIFEOS/` in deployed code/prose means the runtime
+  //        tree, which lives at runtime/LIFEOS here. Idempotent: rewritten
+  //        strings start `runtime/`, so the quote is no longer followed by
+  //        `LIFEOS/`. `@LIFEOS/...` imports (`@` between quote and LIFEOS) and
+  //        `LIFEOS_*` identifiers (no `/`) never match.
+  { name: "R6a", re: /(['"`])LIFEOS\//g, rep: (_m, q) => q + "runtime/LIFEOS/" },
+  // R6b — the separate-arg spelling of R6a: `join(PAI, 'LIFEOS', 'MEMORY',
+  //        ...)`. Anchored to a join/resolve/pathResolve call earlier on the
+  //        same line (variable-length lookbehind, supported by Bun's V8) so a
+  //        display-string "LIFEOS" outside a path expression can't match; the
+  //        quoted arg must be followed by `,` or `)`. Idempotent: the rewritten
+  //        arg is 'runtime/LIFEOS', which no longer matches quote-LIFEOS-quote.
+  { name: "R6b", re: /(?<=\b(?:join|resolve|pathResolve)\([^\n]*)(['"])LIFEOS\1(?=\s*[,)])/g, rep: (_m, q) => q + "runtime/LIFEOS" + q },
 ];
 
 /** Apply all rewrite rules to a string; return the new text + replacement count. */
