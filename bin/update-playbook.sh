@@ -27,6 +27,18 @@ fi
 echo "update-playbook: pulling latest LifeOS playbook (fast-forward only)..."
 git pull --ff-only
 
+# Case-insensitive filesystems (macOS/Windows): pulling a commit that removes a
+# case-twin path (e.g. App/ alongside app/) also deletes the surviving file
+# from disk, because both tracked paths point at the same physical file. Any
+# tracked file the pull left missing from the working tree is restored here.
+# GIT_LITERAL_PATHSPECS: file lists must be literal paths, not globs — payload
+# paths contain glob metacharacters (e.g. app/file/[slug]/page.tsx).
+if [ -n "$(git ls-files --deleted)" ]; then
+  echo "update-playbook: restoring files dropped by case-collision handling..."
+  git ls-files --deleted -z \
+    | GIT_LITERAL_PATHSPECS=1 git restore --pathspec-from-file=- --pathspec-file-nul
+fi
+
 echo "update-playbook: re-deploying LifeOS runtime (idempotent overlay)..."
 bun bin/deploy.ts --apply
 
