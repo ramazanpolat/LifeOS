@@ -279,6 +279,27 @@ function buildSettings(): { json: string; rewrites: number; strippedHooks: numbe
   }
   system.hooks = merged;
 
+  // Claude Code ≥2.1.x no longer matches Write(path) permission rules — file
+  // editing is covered by Edit(path) rules only, and each shipped Write(X)
+  // has an Edit(X) twin. Drop the Write rules (kept, they print a startup
+  // warning per rule); convert any twinless stragglers to Edit.
+  if (system.permissions && typeof system.permissions === "object") {
+    for (const bucket of ["allow", "deny", "ask"]) {
+      const rules = (system.permissions as Record<string, unknown>)[bucket];
+      if (!Array.isArray(rules)) continue;
+      const out: string[] = [];
+      for (const r of rules as string[]) {
+        if (typeof r === "string" && r.startsWith("Write(")) {
+          const twin = "Edit(" + r.slice("Write(".length);
+          if (!rules.includes(twin) && !out.includes(twin)) out.push(twin);
+          continue;
+        }
+        out.push(r);
+      }
+      (system.permissions as Record<string, unknown>)[bucket] = out;
+    }
+  }
+
   if (FULL) {
     // Match upstream DeployComponents.ts statusLine shape: {type,command,refreshInterval}.
     system.statusLine = { type: "command", command: join(RT, "LIFEOS_StatusLine.sh"), refreshInterval: 1 };
