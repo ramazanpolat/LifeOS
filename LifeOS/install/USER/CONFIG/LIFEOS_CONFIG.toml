@@ -51,6 +51,12 @@ token_env_var = "CLOUDFLARE_API_TOKEN"
 allowlist = []
 
 [paths]
-user_dir = "~/.claude/LIFEOS/USER"
-memory_dir = "~/.claude/LIFEOS/MEMORY"
+# user_dir/memory_dir are substituted by bin/deploy.ts at install time so they
+# point at THIS config root. Leaving a hardcoded "~/.claude/LIFEOS/..." here
+# breaks playbook installs silently: LifeosConfig loads fine but resolves to a
+# directory that does not exist, so identity/frontmatter reads fall through to
+# the shipped defaults ("LifeOS" / "User") with no error.
+user_dir = "{{USER_DIR}}"
+memory_dir = "{{MEMORY_DIR}}"
+# Not substituted — deploy cannot know where you keep your projects. Edit this.
 projects_dir = "~/Projects"

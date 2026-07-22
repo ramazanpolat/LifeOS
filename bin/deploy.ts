@@ -442,11 +442,12 @@ function planDryRun(version: string): void {
   log(`     chmod +x       LIFEOS_StatusLine.sh + hooks/*.hook.{ts,sh}`);
 
   // 9 token substitution
-  log(`  9. tokens         substitute {{HOME}} {{BUN}} {{BUN_DIR}} {{USER_DIR}} {{VERSION}} {{LIFEOS_VERSION}} {{CLI_NAME}} over hooks/, runtime/LIFEOS/, agents/, commands/`);
+  log(`  9. tokens         substitute {{HOME}} {{BUN}} {{BUN_DIR}} {{USER_DIR}} {{MEMORY_DIR}} {{VERSION}} {{LIFEOS_VERSION}} {{CLI_NAME}} over hooks/, runtime/LIFEOS/, agents/, commands/`);
 
   // 10 USER scaffold
   const nUser = countMissing(join(PAYLOAD, "USER"), join(CR, "USER"));
   log(` 10. USER           copyMissing install/USER → USER/                (would copy ${nUser} file(s))`);
+  log(`                    then substitute {{USER_DIR}} {{MEMORY_DIR}} over USER/CONFIG/ (no-op if already populated)`);
   row("10 USER", nUser);
 
   // 11 USER symlink
@@ -576,20 +577,23 @@ function applyDeploy(version: string, bunBin: string, bunDir: string): void {
     row("8 path-rewrite", "", "", rewrites, `${changed} files; paths.ts ${patched}`);
   }
 
+  // Token map — shared by step 9 (system trees) and step 10 (USER/CONFIG).
+  const tokenVars: Record<string, string> = {
+    "{{LIFEOS_VERSION}}": version,
+    "{{VERSION}}": version,
+    "{{HOME}}": REAL_HOME,
+    "{{BUN}}": bunBin,
+    "{{BUN_DIR}}": bunDir,
+    "{{USER_DIR}}": join(CR, "USER"),
+    "{{MEMORY_DIR}}": join(RT, "MEMORY"),
+    "{{CLI_NAME}}": "lifeos",
+  };
+
   // 9. token substitution
   {
-    const vars: Record<string, string> = {
-      "{{LIFEOS_VERSION}}": version,
-      "{{VERSION}}": version,
-      "{{HOME}}": REAL_HOME,
-      "{{BUN}}": bunBin,
-      "{{BUN_DIR}}": bunDir,
-      "{{USER_DIR}}": join(CR, "USER"),
-      "{{CLI_NAME}}": "lifeos",
-    };
     let applied = 0;
     for (const dir of [join(CR, "hooks"), RT, join(CR, "agents"), join(CR, "commands")]) {
-      const r = substituteTree(dir, vars);
+      const r = substituteTree(dir, tokenVars);
       applied += r.applied;
     }
     log(`  9. tokens         ${applied} substitution(s) applied`);
@@ -600,8 +604,17 @@ function applyDeploy(version: string, bunBin: string, bunDir: string): void {
   {
     const { copied, failures } = copyMissing(join(PAYLOAD, "USER"), join(CR, "USER"));
     if (failures.length) log(`  ! USER copy failures: ${failures.length}`);
-    log(` 10. USER           copied ${copied} file(s)`);
-    row("10 USER", copied);
+
+    // LIFEOS_CONFIG.toml ships {{USER_DIR}}/{{MEMORY_DIR}} so a playbook install
+    // resolves to THIS config root rather than the upstream ~/.claude default.
+    // Scoped to USER/CONFIG/ so principal-authored content is never rewritten,
+    // and it runs after the copy because copyMissing is the thing that lands the
+    // tokenized scaffold. On an existing install this is a no-op: the file is
+    // already populated (copyMissing never overwrites) and holds no tokens.
+    const sub = substituteTree(join(CR, "USER", "CONFIG"), tokenVars);
+
+    log(` 10. USER           copied ${copied} file(s); ${sub.applied} token(s) in USER/CONFIG`);
+    row("10 USER", copied, "", sub.applied);
   }
 
   // 11. USER symlink + contract check
