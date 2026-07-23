@@ -87,12 +87,12 @@ cleanup() {
   elif [ -n "$WS" ]; then
     echo "herdr workspace kept: $WS (pane $PANE)"
   fi
-  if [ "$KEEP_TMP" != "1" ] && [ "$FAILS" -eq 0 ] && [ $rc -eq 0 ]; then
+  if [ "$KEEP_TMP" != "1" ] && [ "$FAILS" -eq 0 ] && [ "$rc" -eq 0 ]; then
     rm -rf "$LP_RUN"
   else
     echo "E2E artifacts kept at: $LP_RUN"
   fi
-  exit $rc
+  exit "$rc"
 }
 trap cleanup EXIT INT TERM
 

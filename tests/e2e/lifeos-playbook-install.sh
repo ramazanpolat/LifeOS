@@ -4,7 +4,7 @@
 # Drives `claude-playbook` and `bin/deploy.ts` through real herdr terminal panes,
 # exactly as a user would, and asserts the playbook PACKAGING invariants only:
 # install produces a self-contained config root, the deployer is a clean
-# idempotent create-only overlay, git-tracked state stays pristine (only the
+# idempotent managed overlay, git-tracked state stays pristine (only the
 # CLI-owned `.playbook` is ever modified), the update script fast-forwards +
 # redeploys and guards a dirty tree, and delete removes both the install dir and
 # its alias.
@@ -67,11 +67,18 @@ fi
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 GIT_COMMON="$(git -C "$REPO_ROOT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
 PRIMARY_CHECKOUT="$(cd "$(dirname "${GIT_COMMON:-$REPO_ROOT/.git}")" && pwd)"
-SOURCE_URL="${LP_E2E_SOURCE:-file://$PRIMARY_CHECKOUT}"
+SOURCE_OVERRIDE="${LP_E2E_SOURCE:-}"
 BRANCH="${LP_E2E_BRANCH:-$(git -C "$REPO_ROOT" branch --show-current)}"
 CPB_BIN="$(command -v claude-playbook)"
 
 RUN_ROOT="$(mktemp -d "$TMP_ROOT/lifeos-lifecycle-e2e.XXXXXX")"
+if [ -n "$SOURCE_OVERRIDE" ]; then
+  SOURCE_URL="$SOURCE_OVERRIDE"
+else
+  TEST_REMOTE="$RUN_ROOT/lifeos-remote.git"
+  git clone --quiet --bare --branch "$BRANCH" "$PRIMARY_CHECKOUT" "$TEST_REMOTE"
+  SOURCE_URL="file://$TEST_REMOTE"
+fi
 HOME_DIR="$RUN_ROOT/home"
 PLAYBOOKS_DIR="$RUN_ROOT/playbooks"
 SHELL_CONFIG="$RUN_ROOT/zshrc"
@@ -88,7 +95,7 @@ FAILED=0
 
 cleanup() {
   rc=$?
-  if [ "$KEEP_PANES" != "1" ] && [ $rc -eq 0 ]; then
+  if [ "$KEEP_PANES" != "1" ] && [ "$rc" -eq 0 ]; then
     if [ -n "$WS_ID" ]; then
       herdr workspace close "$WS_ID" >/dev/null 2>&1 || true
     fi
@@ -98,12 +105,12 @@ cleanup() {
   else
     echo "herdr workspace kept: ${WS_ID:-none} (panes: $PANES)"
   fi
-  if [ "$KEEP_TMP" != "1" ] && [ $rc -eq 0 ]; then
+  if [ "$KEEP_TMP" != "1" ] && [ "$rc" -eq 0 ]; then
     rm -rf "$RUN_ROOT"
   else
     echo "E2E artifacts kept at: $RUN_ROOT"
   fi
-  exit $rc
+  exit "$rc"
 }
 trap cleanup EXIT INT TERM
 
@@ -120,6 +127,7 @@ export PATH=$(printf '%q' "$PATH")
 export CPB=$(printf '%q' "$CPB_BIN")
 export LP_SOURCE=$(printf '%q' "$SOURCE_URL")
 export LP_BRANCH=$(printf '%q' "$BRANCH")
+export LP_TEST_REMOTE=$(printf '%q' "${TEST_REMOTE:-}")
 export LP_NAME=lifeos
 export LP_ALIAS=lifeos
 export LP_INSTALL=$(printf '%q' "$PLAYBOOKS_DIR/lifeos")
@@ -306,6 +314,11 @@ test -d "$LP_INSTALL/runtime/LIFEOS"
 test -d "$LP_INSTALL/skills"
 test -d "$LP_INSTALL/hooks"
 test -d "$LP_INSTALL/USER"
+test -f "$LP_INSTALL/.lifeos-deploy-state.json"
+# The shared payload keeps normal-installer defaults; only the deployed USER
+# copy is localized for the playbook layout.
+grep -q 'user_dir = "~/.claude/LIFEOS/USER"' LifeOS/install/USER/CONFIG/LIFEOS_CONFIG.toml
+grep -Fq "user_dir = \"$LP_INSTALL/USER\"" USER/CONFIG/LIFEOS_CONFIG.toml
 # Baseline settings.json hash for the idempotency / create-only / update cases.
 shasum -a 256 "$LP_INSTALL/settings.json" | awk '{print $1}' > "$LP_E2E_RUN_ROOT/settings-baseline.hash"
 echo "OK 04_deploy_apply"
@@ -339,7 +352,7 @@ out="$(bun bin/deploy.ts --apply 2>&1)"
 grep -q 'Deploy complete' <<<"$out"
 now="$(shasum -a 256 settings.json | awk '{print $1}')"
 test "$baseline" = "$now"
-grep -q 'left untouched' <<<"$out"
+grep -q 'managed and current' <<<"$out"
 # Second apply copies nothing.
 if grep -qE 'copied [1-9][0-9]* file' <<<"$out"; then
   echo "FAIL: second --apply copied files (not idempotent)" >&2
@@ -350,23 +363,18 @@ echo "OK 06_idempotency"
 CASE
 )"
 
-# 07 full tier: create-only on an EXISTING install ----------------------------
-c07="$(write_case 07_full_create_only <<'CASE'
+# 07 full tier: safely refresh managed settings on an EXISTING install --------
+c07="$(write_case 07_full_upgrade <<'CASE'
 set -euo pipefail
 source "$LP_E2E_ENV"
 cd "$LP_INSTALL"
-baseline="$(cat "$LP_E2E_RUN_ROOT/settings-baseline.hash")"
 out="$(bun bin/deploy.ts --apply --full 2>&1)"
-grep -q 'left untouched' <<<"$out"
-now="$(shasum -a 256 settings.json | awk '{print $1}')"
-# settings.json is create-only: --full must NOT rewrite an existing (core) file.
-test "$baseline" = "$now"
-if grep -q '"statusLine"' settings.json; then
-  echo "FAIL: --full mutated an existing settings.json (statusLine appeared)" >&2
-  exit 1
-fi
+grep -q 'settings.json  UPDATED' <<<"$out"
+grep -q '"statusLine"' settings.json
+grep -q '"spinnerVerbs"' settings.json
+shasum -a 256 settings.json | awk '{print $1}' > "$LP_E2E_RUN_ROOT/settings-baseline.hash"
 test "$(git status --porcelain)" = " M .playbook"
-echo "OK 07_full_create_only"
+echo "OK 07_full_upgrade"
 CASE
 )"
 
@@ -401,13 +409,35 @@ set -euo pipefail
 source "$LP_E2E_ENV"
 cd "$LP_INSTALL"
 baseline="$(cat "$LP_E2E_RUN_ROOT/settings-baseline.hash")"
+if [ -n "$LP_TEST_REMOTE" ]; then
+  publisher="$LP_E2E_RUN_ROOT/publisher"
+  git clone --quiet "$LP_SOURCE" "$publisher"
+  git -C "$publisher" switch --quiet "$LP_BRANCH"
+  git -C "$publisher" config user.name "LifeOS E2E"
+  git -C "$publisher" config user.email "lifeos-e2e@example.invalid"
+  printf '\nUPSTREAM_REFRESH_MARKER\n' >> "$publisher/LifeOS/install/commands/context-search.md"
+  printf '\nUPSTREAM_CONFLICT_MARKER\n' >> "$publisher/LifeOS/install/commands/cs.md"
+  git -C "$publisher" add LifeOS/install/commands/context-search.md LifeOS/install/commands/cs.md
+  git -C "$publisher" commit --quiet -m "test: publish managed payload update"
+  git -C "$publisher" push --quiet origin "$LP_BRANCH"
+  printf '\nLOCAL_CUSTOMIZATION_MARKER\n' >> commands/cs.md
+fi
 out="$(cpb update lifeos 2>&1)"
 printf '%s\n' "$out"
 # ff-only pull + idempotent redeploy.
 grep -qi 'fast-forward only' <<<"$out"
 grep -qi 're-deploying' <<<"$out"
 grep -q 'Deploy complete' <<<"$out"
-# Existing settings.json content is preserved across an update.
+# Unmodified managed files refresh; locally modified managed files are kept.
+if [ -n "$LP_TEST_REMOTE" ]; then
+  grep -q 'UPSTREAM_REFRESH_MARKER' commands/context-search.md
+  grep -q 'LOCAL_CUSTOMIZATION_MARKER' commands/cs.md
+  if grep -q 'UPSTREAM_CONFLICT_MARKER' commands/cs.md; then
+    echo "FAIL: update overwrote a locally customized managed file" >&2
+    exit 1
+  fi
+fi
+# Existing managed settings remain stable when their payload did not change.
 now="$(shasum -a 256 settings.json | awk '{print $1}')"
 test "$baseline" = "$now"
 echo "OK 08_update_happy"
@@ -457,7 +487,7 @@ run_case "$P_MAIN" 03_deploy_dryrun    "$c03"
 run_case "$P_MAIN" 04_deploy_apply     "$c04"
 run_case "$P_MAIN" 05_gitignore        "$c05"
 run_case "$P_MAIN" 06_idempotency      "$c06"
-run_case "$P_MAIN" 07_full_create_only "$c07"
+run_case "$P_MAIN" 07_full_upgrade     "$c07"
 run_case "$P_AUX"  07b_full_fresh      "$c07b"
 run_case "$P_MAIN" 08_update_happy     "$c08"
 run_case "$P_MAIN" 09_update_dirty_guard "$c09"

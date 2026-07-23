@@ -17,36 +17,39 @@
  *   bun bin/deploy.ts --apply    deploy core.
  *   bun bin/deploy.ts --apply --full   also wire statusLine + spinner enhancements.
  *
- * Idempotent: every copy goes through copyMissing (never overwrites); the
- * path-rewrite and token-substitution passes are no-ops on already-deployed
- * files; an existing settings.json is left untouched.
+ * Idempotent and update-safe: system-managed files are hash-tracked. Files that
+ * still match the last deployed version are refreshed; locally modified or
+ * pre-existing files are preserved. USER content remains create-only.
  *
- * Reuses the upstream engine (InstallEngine.ts) for copyMissing / mergeHooks /
- * substituteTree / setupUserSeparation / checkSymlinkContract. It does NOT shell
+ * Reuses the upstream engine (InstallEngine.ts) for USER copyMissing,
+ * mergeHooks, setupUserSeparation, and checkSymlinkContract. It does NOT shell
  * out to DeployCore / InstallSettings / InstallHooks — their targets hard-code
  * <configRoot>/LIFEOS and ~/.claude, both wrong for this layout.
  */
 
 import {
   chmodSync,
+  cpSync,
   existsSync,
   lstatSync,
   mkdirSync,
   readFileSync,
   readdirSync,
   realpathSync,
+  renameSync,
+  rmSync,
   statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import { createHash } from "node:crypto";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, relative } from "node:path";
 import {
   checkSymlinkContract,
   copyMissing,
   mergeHooks,
   setupUserSeparation,
-  substituteTree,
 } from "../LifeOS/Tools/InstallEngine";
 
 // ── paths ─────────────────────────────────────────────────────────────
@@ -54,11 +57,12 @@ const CR = dirname(import.meta.dir); // checkout root = parent of bin/
 const RT = join(CR, "runtime", "LIFEOS");
 const PAYLOAD = join(CR, "LifeOS", "install");
 const REAL_HOME = homedir();
+const STATE_PATH = join(CR, ".lifeos-deploy-state.json");
 
 // ── args ──────────────────────────────────────────────────────────────
 const argv = process.argv.slice(2);
 const APPLY = argv.includes("--apply");
-const FULL = argv.includes("--full");
+let FULL = argv.includes("--full");
 
 // ── engineering-log output helpers ────────────────────────────────────
 function log(msg = ""): void {
@@ -218,6 +222,233 @@ function* walkFiles(dir: string, skip: Set<string> = WALK_SKIP): Generator<strin
   }
 }
 
+interface DeployState {
+  version: 1;
+  full: boolean;
+  files: Record<string, string>;
+}
+
+interface SyncResult {
+  copied: number;
+  updated: number;
+  preserved: number;
+  failures: string[];
+  written: string[];
+}
+
+function relativeKey(path: string): string {
+  return relative(CR, path).split("\\").join("/");
+}
+
+function isManagedKey(key: string): boolean {
+  return key === "settings.json" ||
+    ["skills/", "runtime/LIFEOS/", "hooks/", "agents/", "commands/"].some((prefix) => key.startsWith(prefix));
+}
+
+function assertSafeDestination(path: string): void {
+  const key = relativeKey(path);
+  if (key === ".." || key.startsWith("../") || key.startsWith("/")) {
+    die(`refusing destination outside the checkout root: ${path}`);
+  }
+  const parts = key.split("/").filter(Boolean);
+  let cursor = CR;
+  for (const part of parts) {
+    cursor = join(cursor, part);
+    try {
+      if (lstatSync(cursor).isSymbolicLink()) {
+        die(`refusing to write through symlink: ${relativeKey(cursor)}`);
+      }
+    } catch (err) {
+      if (err instanceof Error && "code" in err && err.code === "ENOENT") return;
+      throw err;
+    }
+  }
+}
+
+function assertNoSymlinksInTree(root: string): void {
+  if (!existsSync(root)) return;
+  for (const entry of readdirSync(root, { withFileTypes: true })) {
+    const path = join(root, entry.name);
+    if (entry.isSymbolicLink()) die(`refusing to scaffold through symlink: ${relativeKey(path)}`);
+    if (entry.isDirectory()) assertNoSymlinksInTree(path);
+  }
+}
+
+function hashFile(path: string): string {
+  return createHash("sha256").update(readFileSync(path)).digest("hex");
+}
+
+function loadDeployState(): DeployState {
+  if (!existsSync(STATE_PATH)) return { version: 1, full: false, files: {} };
+  try {
+    const parsed = JSON.parse(readFileSync(STATE_PATH, "utf8")) as Partial<DeployState>;
+    if (parsed.version !== 1 || typeof parsed.files !== "object" || parsed.files === null) {
+      throw new Error("unsupported state shape");
+    }
+    for (const [key, value] of Object.entries(parsed.files)) {
+      if (!isManagedKey(key) || typeof value !== "string" || !/^[a-f0-9]{64}$/.test(value)) {
+        throw new Error(`unsafe or invalid managed-file entry: ${key}`);
+      }
+    }
+    return { version: 1, full: parsed.full === true, files: parsed.files };
+  } catch (err) {
+    die(`cannot read ${relativeKey(STATE_PATH)} safely: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+/**
+ * Synchronize a system-managed tree. A previously deployed file is refreshed
+ * only when its current hash still matches the deploy state; locally edited or
+ * pre-existing files are preserved.
+ */
+function syncManagedTree(
+  src: string,
+  dst: string,
+  previous: DeployState,
+  nextFiles: Record<string, string>,
+  seen: Set<string>,
+): SyncResult {
+  const result: SyncResult = { copied: 0, updated: 0, preserved: 0, failures: [], written: [] };
+  const engineSkip = new Set(["node_modules", ".git", "MEMORY"]);
+
+  const walk = (s: string, d: string): void => {
+    if (!existsSync(s)) return;
+    const sourceStat = lstatSync(s);
+    if (sourceStat.isDirectory()) {
+      for (const entry of readdirSync(s, { withFileTypes: true })) {
+        if (engineSkip.has(entry.name)) continue;
+        if (entry.isDirectory() || entry.isFile()) walk(join(s, entry.name), join(d, entry.name));
+      }
+      return;
+    }
+    if (!sourceStat.isFile()) return;
+
+    const key = relativeKey(d);
+    seen.add(key);
+    try {
+      assertSafeDestination(d);
+      if (!existsSync(d)) {
+        mkdirSync(dirname(d), { recursive: true });
+        cpSync(s, d);
+        result.copied++;
+        result.written.push(d);
+        return;
+      }
+
+      const destinationStat = lstatSync(d);
+      const priorHash = previous.files[key];
+      if (destinationStat.isFile() && priorHash && hashFile(d) === priorHash) {
+        cpSync(s, d);
+        result.updated++;
+        result.written.push(d);
+        return;
+      }
+
+      result.preserved++;
+      if (!priorHash) delete nextFiles[key];
+    } catch (err) {
+      result.failures.push(`${s} → ${d}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
+
+  walk(src, dst);
+  return result;
+}
+
+function removeStaleManagedFiles(previous: DeployState, nextFiles: Record<string, string>, seen: Set<string>): { removed: number; preserved: number } {
+  let removed = 0;
+  let preserved = 0;
+  for (const [key, priorHash] of Object.entries(previous.files)) {
+    if (key === "settings.json" || seen.has(key)) continue;
+    const path = join(CR, key);
+    assertSafeDestination(path);
+    if (!existsSync(path)) {
+      delete nextFiles[key];
+      continue;
+    }
+    if (lstatSync(path).isFile() && hashFile(path) === priorHash) {
+      rmSync(path);
+      delete nextFiles[key];
+      removed++;
+    } else {
+      delete nextFiles[key];
+      preserved++;
+    }
+  }
+  return { removed, preserved };
+}
+
+function saveDeployState(files: Record<string, string>): void {
+  const tmp = STATE_PATH + ".tmp";
+  const state: DeployState = { version: 1, full: FULL, files };
+  writeFileSync(tmp, JSON.stringify(state, null, 2) + "\n");
+  renameSync(tmp, STATE_PATH);
+}
+
+function failOnCopyErrors(label: string, failures: string[]): void {
+  if (!failures.length) return;
+  die(`${label} failed:\n${failures.map((failure) => `  - ${failure}`).join("\n")}`);
+}
+
+function rewriteManagedFiles(files: string[]): { rewrites: number; changed: number } {
+  let rewrites = 0;
+  let changed = 0;
+  for (const file of files) {
+    const ext = file.slice(file.lastIndexOf("."));
+    if (!TEXT_EXT.has(ext)) continue;
+    const before = readFileSync(file, "utf8");
+    const result = rewriteText(before);
+    if (result.count > 0 && result.text !== before) {
+      writeFileSync(file, result.text);
+      rewrites += result.count;
+      changed++;
+    }
+  }
+  return { rewrites, changed };
+}
+
+function substituteManagedFiles(files: string[], vars: Record<string, string>): number {
+  let applied = 0;
+  for (const file of files) {
+    const ext = file.slice(file.lastIndexOf("."));
+    if (!TEXT_EXT.has(ext)) continue;
+    const before = readFileSync(file, "utf8");
+    let after = before;
+    for (const [placeholder, value] of Object.entries(vars)) {
+      const parts = after.split(placeholder);
+      applied += parts.length - 1;
+      after = parts.join(value);
+    }
+    if (after !== before) writeFileSync(file, after);
+  }
+  return applied;
+}
+
+/**
+ * The shared payload must retain the normal ~/.claude defaults because the
+ * standard LifeOS installer does not know playbook-only tokens. Localize only
+ * the two untouched defaults (or tokens left by an older playbook build).
+ */
+function localizeLifeosConfig(userDir: string, memoryDir: string): number {
+  const path = join(CR, "USER", "CONFIG", "LIFEOS_CONFIG.toml");
+  if (!existsSync(path)) return 0;
+  const before = readFileSync(path, "utf8");
+  let after = before;
+  let changed = 0;
+  const replacements: Array<[RegExp, string]> = [
+    [/^user_dir = "(?:~\/\.claude\/LIFEOS\/USER|\{\{USER_DIR\}\})"$/m, `user_dir = ${JSON.stringify(userDir)}`],
+    [/^memory_dir = "(?:~\/\.claude\/LIFEOS\/MEMORY|\{\{MEMORY_DIR\}\})"$/m, `memory_dir = ${JSON.stringify(memoryDir)}`],
+  ];
+  for (const [pattern, replacement] of replacements) {
+    if (pattern.test(after)) {
+      after = after.replace(pattern, replacement);
+      changed++;
+    }
+  }
+  if (after !== before) writeFileSync(path, after);
+  return changed;
+}
+
 /** copyMissing is destructive; this mirrors its count for dry-run planning. */
 function countMissing(src: string, dst: string): number {
   const engineSkip = new Set(["node_modules", ".git", "MEMORY"]);
@@ -277,7 +508,7 @@ function preflight(): void {
   if (existsSync(join(CR, "LifeOS", "SKILL.md")) === false) die(`missing LifeOS/SKILL.md — cannot create the skills/LifeOS loader symlink.`);
 }
 
-// ── settings.json build (create-only) ─────────────────────────────────
+// ── settings.json build ───────────────────────────────────────────────
 const STRIP_SESSIONSTART = /SettingsBackport|MergeSettings/;
 
 function buildSettings(): { json: string; rewrites: number; strippedHooks: number } {
@@ -345,6 +576,7 @@ function buildSettings(): { json: string; rewrites: number; strippedHooks: numbe
 
 // ── main ──────────────────────────────────────────────────────────────
 function main(): void {
+  if (APPLY && loadDeployState().full) FULL = true;
   const version = readFileSync(join(PAYLOAD, "LIFEOS", "VERSION"), "utf8").trim();
   const bunBin = process.execPath; // this script runs under bun
   const bunDir = dirname(bunBin);
@@ -388,7 +620,7 @@ function planDryRun(version: string): void {
 
   // 1 skills + LifeOS symlink
   const nSkills = countMissing(join(PAYLOAD, "skills"), join(CR, "skills"));
-  log(`  1. skills         copyMissing install/skills → skills/            (would copy ${nSkills} file(s))`);
+  log(`  1. skills         sync managed install/skills → skills/           (would copy ${nSkills} missing file(s))`);
   const skillLink = join(CR, "skills", "LifeOS");
   log(`     skills/LifeOS  symlink → ../LifeOS                             (${existsSync(skillLink) ? "exists — skip" : "would create"})`);
   row("1 skills", nSkills, "", "", "loader symlink skills/LifeOS");
@@ -400,7 +632,7 @@ function planDryRun(version: string): void {
     if (runtimeSkip.has(e.name)) continue;
     nRuntime += countMissing(join(PAYLOAD, "LIFEOS", e.name), join(RT, e.name));
   }
-  log(`  2. runtime        copyMissing install/LIFEOS/* (−USER,MEMORY) → runtime/LIFEOS/   (would copy ${nRuntime} file(s))`);
+  log(`  2. runtime        sync managed install/LIFEOS/* (−USER,MEMORY) → runtime/LIFEOS/   (would copy ${nRuntime} missing file(s))`);
   row("2 runtime", nRuntime);
 
   // 3 MEMORY scaffold
@@ -411,14 +643,14 @@ function planDryRun(version: string): void {
 
   // 4 hooks
   const nHooks = countMissing(join(PAYLOAD, "hooks"), join(CR, "hooks"));
-  log(`  4. hooks          copyMissing install/hooks → hooks/              (would copy ${nHooks} file(s))`);
+  log(`  4. hooks          sync managed install/hooks → hooks/             (would copy ${nHooks} missing file(s))`);
   row("4 hooks", nHooks);
 
   // 5 agents + commands
   const nAgents = countMissing(join(PAYLOAD, "agents"), join(CR, "agents"));
   const nCommands = countMissing(join(PAYLOAD, "commands"), join(CR, "commands"));
-  log(`  5. agents         copyMissing install/agents → agents/            (would copy ${nAgents} file(s))`);
-  log(`     commands       copyMissing install/commands → commands/        (would copy ${nCommands} file(s))`);
+  log(`  5. agents         sync managed install/agents → agents/           (would copy ${nAgents} missing file(s))`);
+  log(`     commands       sync managed install/commands → commands/       (would copy ${nCommands} missing file(s))`);
   row("5 agents", nAgents);
   row("5 commands", nCommands);
 
@@ -447,7 +679,7 @@ function planDryRun(version: string): void {
   // 10 USER scaffold
   const nUser = countMissing(join(PAYLOAD, "USER"), join(CR, "USER"));
   log(` 10. USER           copyMissing install/USER → USER/                (would copy ${nUser} file(s))`);
-  log(`                    then substitute {{USER_DIR}} {{MEMORY_DIR}} over USER/CONFIG/ (no-op if already populated)`);
+  log(`                    then localize untouched ~/.claude USER/MEMORY defaults in USER/CONFIG/`);
   row("10 USER", nUser);
 
   // 11 USER symlink
@@ -467,38 +699,57 @@ function planDryRun(version: string): void {
 function applyDeploy(version: string, bunBin: string, bunDir: string): void {
   log("APPLYING:");
   log("");
+  const previous = loadDeployState();
+  const nextFiles = { ...previous.files };
+  const seen = new Set<string>();
+  const pathRewriteFiles: string[] = [];
+  const tokenFiles: string[] = [];
+  const managedWritten: string[] = [];
 
   // 1. skills + loader symlink
   {
-    const { copied, failures } = copyMissing(join(PAYLOAD, "skills"), join(CR, "skills"));
-    if (failures.length) log(`  ! skills copy failures: ${failures.length}`);
+    const result = syncManagedTree(join(PAYLOAD, "skills"), join(CR, "skills"), previous, nextFiles, seen);
+    failOnCopyErrors("skills synchronization", result.failures);
+    managedWritten.push(...result.written);
     let linkNote = "";
     const link = join(CR, "skills", "LifeOS");
-    if (!existsSync(link)) {
+    let linkEntryExists = false;
+    try {
+      lstatSync(link);
+      linkEntryExists = true;
+    } catch {}
+    if (!linkEntryExists) {
       mkdirSync(dirname(link), { recursive: true });
       symlinkSync("../LifeOS", link); // relative → <CR>/LifeOS
       linkNote = "skills/LifeOS → ../LifeOS created";
+    } else if (!existsSync(link)) {
+      die(`skills/LifeOS is a dangling symlink; remove or repair it before deploying`);
     } else {
       linkNote = "skills/LifeOS exists";
     }
-    log(`  1. skills         copied ${copied} file(s); ${linkNote}`);
-    row("1 skills", copied, "", "", linkNote);
+    log(`  1. skills         copied ${result.copied}, updated ${result.updated}, preserved ${result.preserved}; ${linkNote}`);
+    row("1 skills", result.copied, result.preserved, result.updated, linkNote);
   }
 
   // 2. runtime (per top-level entry, minus USER/MEMORY/node_modules/.git)
   {
     const runtimeSkip = new Set(["USER", "MEMORY", "node_modules", ".git"]);
-    let copied = 0;
+    let copied = 0, updated = 0, preserved = 0;
     const fails: string[] = [];
     for (const e of readdirSync(join(PAYLOAD, "LIFEOS"), { withFileTypes: true })) {
       if (runtimeSkip.has(e.name)) continue;
-      const r = copyMissing(join(PAYLOAD, "LIFEOS", e.name), join(RT, e.name));
+      const r = syncManagedTree(join(PAYLOAD, "LIFEOS", e.name), join(RT, e.name), previous, nextFiles, seen);
       copied += r.copied;
+      updated += r.updated;
+      preserved += r.preserved;
       fails.push(...r.failures);
+      managedWritten.push(...r.written);
+      pathRewriteFiles.push(...r.written);
+      tokenFiles.push(...r.written);
     }
-    if (fails.length) log(`  ! runtime copy failures: ${fails.length}`);
-    log(`  2. runtime        copied ${copied} file(s) → ${RT}`);
-    row("2 runtime", copied);
+    failOnCopyErrors("runtime synchronization", fails);
+    log(`  2. runtime        copied ${copied}, updated ${updated}, preserved ${preserved} → ${RT}`);
+    row("2 runtime", copied, preserved, updated);
   }
 
   // 3. MEMORY scaffold
@@ -518,32 +769,54 @@ function applyDeploy(version: string, bunBin: string, bunDir: string): void {
 
   // 4. hooks
   {
-    const { copied, failures } = copyMissing(join(PAYLOAD, "hooks"), join(CR, "hooks"));
-    if (failures.length) log(`  ! hooks copy failures: ${failures.length}`);
-    log(`  4. hooks          copied ${copied} file(s)`);
-    row("4 hooks", copied);
+    const result = syncManagedTree(join(PAYLOAD, "hooks"), join(CR, "hooks"), previous, nextFiles, seen);
+    failOnCopyErrors("hooks synchronization", result.failures);
+    managedWritten.push(...result.written);
+    pathRewriteFiles.push(...result.written);
+    tokenFiles.push(...result.written);
+    log(`  4. hooks          copied ${result.copied}, updated ${result.updated}, preserved ${result.preserved}`);
+    row("4 hooks", result.copied, result.preserved, result.updated);
   }
 
   // 5. agents + commands
   {
-    const a = copyMissing(join(PAYLOAD, "agents"), join(CR, "agents"));
-    const c = copyMissing(join(PAYLOAD, "commands"), join(CR, "commands"));
-    log(`  5. agents         copied ${a.copied} file(s); commands copied ${c.copied} file(s)`);
-    row("5 agents", a.copied);
-    row("5 commands", c.copied);
+    const a = syncManagedTree(join(PAYLOAD, "agents"), join(CR, "agents"), previous, nextFiles, seen);
+    const c = syncManagedTree(join(PAYLOAD, "commands"), join(CR, "commands"), previous, nextFiles, seen);
+    failOnCopyErrors("agents synchronization", a.failures);
+    failOnCopyErrors("commands synchronization", c.failures);
+    managedWritten.push(...a.written, ...c.written);
+    tokenFiles.push(...a.written, ...c.written);
+    log(`  5. agents         copied ${a.copied}, updated ${a.updated}, preserved ${a.preserved}; commands copied ${c.copied}, updated ${c.updated}, preserved ${c.preserved}`);
+    row("5 agents", a.copied, a.preserved, a.updated);
+    row("5 commands", c.copied, c.preserved, c.updated);
   }
 
-  // 6. settings.json (create-only)
+  // 6. settings.json (refresh only while it remains deployer-managed)
   {
     const settingsPath = join(CR, "settings.json");
-    if (existsSync(settingsPath)) {
-      log(`  6. settings.json  EXISTS → left untouched`);
-      row("6 settings.json", "-", "left untouched");
-    } else {
-      const { json, rewrites, strippedHooks } = buildSettings();
+    assertSafeDestination(settingsPath);
+    const key = relativeKey(settingsPath);
+    const { json, rewrites, strippedHooks } = buildSettings();
+    seen.add(key);
+    if (!existsSync(settingsPath)) {
       writeFileSync(settingsPath, json);
       log(`  6. settings.json  CREATED (${strippedHooks} SessionStart backport hook(s) stripped; ${rewrites} path rewrite(s); env expanded)${FULL ? "; +statusLine +spinner" : ""}`);
       row("6 settings.json", "created", "", rewrites, FULL ? "full: statusLine+spinner" : "");
+      nextFiles[key] = hashFile(settingsPath);
+    } else if (previous.files[key] && hashFile(settingsPath) === previous.files[key]) {
+      if (readFileSync(settingsPath, "utf8") === json) {
+        log(`  6. settings.json  managed and current`);
+        row("6 settings.json", "-", "current");
+      } else {
+        writeFileSync(settingsPath, json);
+        log(`  6. settings.json  UPDATED (${strippedHooks} SessionStart backport hook(s) stripped; ${rewrites} path rewrite(s); env expanded)${FULL ? "; +statusLine +spinner" : ""}`);
+        row("6 settings.json", "updated", "", rewrites, FULL ? "full: statusLine+spinner" : "");
+      }
+      nextFiles[key] = hashFile(settingsPath);
+    } else {
+      delete nextFiles[key];
+      log(`  6. settings.json  locally modified or pre-existing → preserved`);
+      row("6 settings.json", "-", "preserved");
     }
   }
 
@@ -552,29 +825,14 @@ function applyDeploy(version: string, bunBin: string, bunDir: string): void {
 
   // 8. path-rewrite pass over deployed copies + paths.ts patch + chmod
   {
-    let files = 0;
-    let rewrites = 0;
-    let changed = 0;
-    for (const dir of [join(CR, "hooks"), RT]) {
-      for (const f of walkFiles(dir)) {
-        const ext = f.slice(f.lastIndexOf("."));
-        if (!TEXT_EXT.has(ext)) continue;
-        files++;
-        const before = readFileSync(f, "utf8");
-        const { text, count } = rewriteText(before);
-        if (count > 0 && text !== before) {
-          writeFileSync(f, text);
-          rewrites += count;
-          changed++;
-        }
-      }
-    }
+    const rewritten = rewriteManagedFiles(pathRewriteFiles);
     // paths.ts patch: getClaudeDir() must honor CLAUDE_CONFIG_DIR first.
-    const patched = patchPathsTs();
+    const pathsFile = join(CR, "hooks", "lib", "paths.ts");
+    const patched = pathRewriteFiles.includes(pathsFile) ? patchPathsTs() : "managed copy unchanged";
     // chmod +x on the statusline + hook scripts.
     const chmodCount = chmodExecutables();
-    log(`  8. path-rewrite   ${rewrites} rewrite(s) across ${changed} file(s) (scanned ${files}); paths.ts patch: ${patched}; chmod +x on ${chmodCount} script(s)`);
-    row("8 path-rewrite", "", "", rewrites, `${changed} files; paths.ts ${patched}`);
+    log(`  8. path-rewrite   ${rewritten.rewrites} rewrite(s) across ${rewritten.changed} managed file(s); paths.ts patch: ${patched}; chmod +x on ${chmodCount} script(s)`);
+    row("8 path-rewrite", "", "", rewritten.rewrites, `${rewritten.changed} files; paths.ts ${patched}`);
   }
 
   // Token map — shared by step 9 (system trees) and step 10 (USER/CONFIG).
@@ -591,30 +849,21 @@ function applyDeploy(version: string, bunBin: string, bunDir: string): void {
 
   // 9. token substitution
   {
-    let applied = 0;
-    for (const dir of [join(CR, "hooks"), RT, join(CR, "agents"), join(CR, "commands")]) {
-      const r = substituteTree(dir, tokenVars);
-      applied += r.applied;
-    }
+    const applied = substituteManagedFiles(tokenFiles, tokenVars);
     log(`  9. tokens         ${applied} substitution(s) applied`);
     row("9 tokens", "", "", applied);
   }
 
   // 10. USER scaffold
   {
+    assertSafeDestination(join(CR, "USER"));
+    assertNoSymlinksInTree(join(CR, "USER"));
     const { copied, failures } = copyMissing(join(PAYLOAD, "USER"), join(CR, "USER"));
-    if (failures.length) log(`  ! USER copy failures: ${failures.length}`);
+    failOnCopyErrors("USER scaffold", failures);
+    const localized = localizeLifeosConfig(tokenVars["{{USER_DIR}}"], tokenVars["{{MEMORY_DIR}}"]);
 
-    // LIFEOS_CONFIG.toml ships {{USER_DIR}}/{{MEMORY_DIR}} so a playbook install
-    // resolves to THIS config root rather than the upstream ~/.claude default.
-    // Scoped to USER/CONFIG/ so principal-authored content is never rewritten,
-    // and it runs after the copy because copyMissing is the thing that lands the
-    // tokenized scaffold. On an existing install this is a no-op: the file is
-    // already populated (copyMissing never overwrites) and holds no tokens.
-    const sub = substituteTree(join(CR, "USER", "CONFIG"), tokenVars);
-
-    log(` 10. USER           copied ${copied} file(s); ${sub.applied} token(s) in USER/CONFIG`);
-    row("10 USER", copied, "", sub.applied);
+    log(` 10. USER           copied ${copied} file(s); localized ${localized} default path(s) in USER/CONFIG`);
+    row("10 USER", copied, "", localized);
   }
 
   // 11. USER symlink + contract check
@@ -630,22 +879,34 @@ function applyDeploy(version: string, bunBin: string, bunDir: string): void {
   {
     const pkgSrc = join(PAYLOAD, "package.json");
     const pkgDst = join(CR, "package.json");
+    assertSafeDestination(pkgDst);
     let copied = 0;
     if (!existsSync(pkgDst)) {
       const r = copyMissing(pkgSrc, pkgDst);
+      failOnCopyErrors("dependency manifest copy", r.failures);
       copied = r.copied;
     }
     log(` 12. deps           package.json ${copied ? "copied" : "present"}; running bun install...`);
     const proc = Bun.spawnSync(["bun", "install"], { cwd: CR, stdout: "pipe", stderr: "pipe" });
     if (proc.exitCode !== 0) {
-      log(`  ! bun install exited ${proc.exitCode}: ${proc.stderr.toString().trim().split("\n").slice(-3).join(" | ")}`);
-      row("12 deps", copied ? "copied" : "present", "", "", `bun install FAILED (${proc.exitCode})`);
-    } else {
-      const hasYaml = existsSync(join(CR, "node_modules", "yaml"));
-      log(`     bun install    ok (node_modules/yaml ${hasYaml ? "present" : "MISSING"})`);
-      row("12 deps", copied ? "copied" : "present", "", "", `bun install ok`);
+      die(`bun install exited ${proc.exitCode}: ${proc.stderr.toString().trim().split("\n").slice(-3).join(" | ")}`);
     }
+    const hasYaml = existsSync(join(CR, "node_modules", "yaml"));
+    if (!hasYaml) die(`bun install exited successfully but node_modules/yaml is missing`);
+    log(`     bun install    ok (node_modules/yaml present)`);
+    row("12 deps", copied ? "copied" : "present", "", "", `bun install ok`);
   }
+
+  // Remove payload files that disappeared upstream only while their deployed
+  // copies are still byte-for-byte managed. Locally modified stale files stay.
+  const stale = removeStaleManagedFiles(previous, nextFiles, seen);
+  if (stale.removed || stale.preserved) {
+    log(` 13. stale files    removed ${stale.removed} managed file(s); preserved ${stale.preserved} locally modified file(s)`);
+    row("13 stale files", stale.removed, stale.preserved);
+  }
+
+  for (const path of managedWritten) nextFiles[relativeKey(path)] = hashFile(path);
+  saveDeployState(nextFiles);
 
   log("");
   printSummary();
@@ -655,12 +916,12 @@ function applyDeploy(version: string, bunBin: string, bunDir: string): void {
 /** Insert a CLAUDE_CONFIG_DIR-first branch at the top of getClaudeDir(). */
 function patchPathsTs(): string {
   const p = join(CR, "hooks", "lib", "paths.ts");
-  if (!existsSync(p)) return "paths.ts not found (skipped)";
+  if (!existsSync(p)) die(`required deployed hook helper missing: ${relativeKey(p)}`);
   let src = readFileSync(p, "utf8");
   if (src.includes("process.env.CLAUDE_CONFIG_DIR")) return "already patched";
   const anchor = "export function getClaudeDir(): string {";
   const idx = src.indexOf(anchor);
-  if (idx < 0) return "getClaudeDir not found (skipped)";
+  if (idx < 0) die(`cannot patch ${relativeKey(p)}: getClaudeDir() anchor not found`);
   const insert =
     anchor +
     "\n  // Playbook layout: the config root is CLAUDE_CONFIG_DIR (the checkout root).\n" +

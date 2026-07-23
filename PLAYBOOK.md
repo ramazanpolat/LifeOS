@@ -14,7 +14,7 @@ and offers to run the deploy for you.
 ## Install
 
 ```sh
-claude-playbook install https://github.com/ramazanpolat/LifeOS --name lifeos --alias lifeos
+claude-playbook install https://github.com/danielmiessler/LifeOS --name lifeos --alias lifeos
 ```
 
 This clones the repo to `~/.claude-playbooks/lifeos/` and registers the
@@ -46,8 +46,9 @@ CLAUDE_CONFIG_DIR=~/.claude-playbooks/lifeos bun ~/.claude-playbooks/lifeos/bin/
 `--apply` deploys the core (settings, hooks, skills, agents, commands, runtime,
 the USER scaffold + symlink, and `bun install`). Add `--full` to also apply the
 enhancements (statusline, tooltips, spinner verbs). The deploy is idempotent: it
-never overwrites files you have modified, and it never touches the `LifeOS/`
-payload.
+refreshes only files that still match the last deployed version, preserves files
+you have modified, and never touches the `LifeOS/` payload. Managed-file hashes
+are stored in the gitignored `.lifeos-deploy-state.json`.
 
 After deploying, restart the `lifeos` session so the freshly written
 `settings.json` and `hooks/` load.
@@ -96,7 +97,8 @@ This runs `bin/update-playbook.sh`, which refuses if you have local
 modifications to tracked files, fast-forwards the checkout (`git pull
 --ff-only`), then re-runs `bun bin/deploy.ts --apply` to re-overlay the runtime.
 Because the deploy is idempotent and never overwrites user-modified files, your
-customizations and USER data survive the update.
+customizations and USER data survive the update. Unmodified system files are
+refreshed to the pulled version; locally modified copies are reported and kept.
 
 ## Uninstall
 
