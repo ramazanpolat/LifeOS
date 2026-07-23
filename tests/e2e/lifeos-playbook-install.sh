@@ -247,7 +247,7 @@ setup_workspace
 c01="$(write_case 01_install <<'CASE'
 set -euo pipefail
 source "$LP_E2E_ENV"
-out="$(cpb install "$LP_SOURCE" --branch "$LP_BRANCH" --name "$LP_NAME" --alias "$LP_ALIAS" 2>&1)"
+out="$(cpb install "$LP_SOURCE" ${LP_BRANCH:+--branch $LP_BRANCH} --name "$LP_NAME" --alias "$LP_ALIAS" 2>&1)"
 printf '%s\n' "$out"
 grep -q "Installed \"$LP_NAME\"" <<<"$out"
 # A packaged playbook must ship a CLAUDE.md — the CLI warns loudly otherwise.
@@ -440,7 +440,7 @@ pbfull="$LP_E2E_RUN_ROOT/playbooks-full"
 scfull="$LP_E2E_RUN_ROOT/zshrc-full"
 mkdir -p "$pbfull"; : > "$scfull"
 "$CPB" --playbooks-dir "$pbfull" --shell-config "$scfull" \
-  install "$LP_SOURCE" --branch "$LP_BRANCH" --name lifeosfull --alias lifeosfull >/dev/null 2>&1
+  install "$LP_SOURCE" ${LP_BRANCH:+--branch $LP_BRANCH} --name lifeosfull --alias lifeosfull >/dev/null 2>&1
 inst="$pbfull/lifeosfull"
 test -d "$inst"
 cd "$inst"

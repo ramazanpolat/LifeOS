@@ -316,7 +316,7 @@ source "$LP_RUN/env.sh"
 mkdir -p "$HOME" "$CLAUDE_PLAYBOOKS_DIR"
 : > "$CLAUDE_SHELL_CONFIG"
 "$CPB" --playbooks-dir "$CLAUDE_PLAYBOOKS_DIR" --shell-config "$CLAUDE_SHELL_CONFIG" \
-  install "$LP_SRC_URL" --branch "$LP_SRC_BRANCH" --name lifeos --no-alias
+  install "$LP_SRC_URL" ${LP_SRC_BRANCH:+--branch $LP_SRC_BRANCH} --name lifeos --no-alias
 test -f "$L/bin/deploy.ts"
 cd "$L"
 CLAUDE_CONFIG_DIR="$L" "$BUN" bin/deploy.ts --apply --full

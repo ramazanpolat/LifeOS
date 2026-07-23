@@ -295,6 +295,17 @@ const RULES: Rule[] = [
   //        quoted arg must be followed by `,` or `)`. Idempotent: the rewritten
   //        arg is 'runtime/LIFEOS', which no longer matches quote-LIFEOS-quote.
   { name: "R6b", re: /(?<=\b(?:join|resolve|pathResolve)\([^\n]*)(['"])LIFEOS\1(?=\s*[,)])/g, rep: (_m, q) => q + "runtime/LIFEOS" + q },
+  // R6c — the MULTILINE spelling of R6b. A `join(<config-root-expr>,\n "LIFEOS",
+  //        \n "USER", …)` whose `"LIFEOS"` arg sits on its OWN line defeats R6b's
+  //        same-line (`[^\n]*`) lookbehind, so the module resolves <CR>/LIFEOS
+  //        (the tracked payload on macOS) instead of <CR>/runtime/LIFEOS. This
+  //        matches a line that is ENTIRELY a quoted `LIFEOS` path segment (+
+  //        optional trailing comma) — an unambiguous standalone join/array arg —
+  //        and prepends `runtime/`. VERIFIED: the payload's only 4 such lines are
+  //        all join path args (HealthSync, MergeSettings, PULSE syslog/projects).
+  //        Idempotent: the rewritten line is `"runtime/LIFEOS"`, which no longer
+  //        matches. `m` flag anchors ^/$ to line boundaries.
+  { name: "R6c", re: /^([ \t]*)(['"])LIFEOS\2(,?[ \t]*)$/gm, rep: (_m, ind, q, tail) => ind + q + "runtime/LIFEOS" + q + tail },
 ];
 
 /** Apply all rewrite rules to a string; return the new text + replacement count. */
