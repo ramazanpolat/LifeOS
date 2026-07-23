@@ -649,6 +649,63 @@ echo "OK 09c_skills_migration"
 CASE
 )"
 
+# 09d migration REFUSES to delete unmanaged skills/LifeOS content ------------
+c09d="$(write_case 09d_skills_migration_refuses <<'CASE'
+set -euo pipefail
+source "$LP_E2E_ENV"
+cd "$LP_INSTALL"
+link="skills/LifeOS"
+# Replace the loader symlink with an UNMANAGED directory (a custom user skill,
+# or a managed dir carrying local edits). The migration must REFUSE to delete
+# it and stop with an actionable error, preserving the content.
+rm -f "$link"; mkdir -p "$link"
+printf 'my custom LifeOS skill — must survive\n' > "$link/SKILL.md"
+if out="$(bun bin/deploy.ts --apply 2>&1)"; then
+  echo "FAIL: deploy did not refuse to delete unmanaged skills/LifeOS" >&2
+  printf '%s\n' "$out" >&2; exit 1
+fi
+printf '%s\n' "$out" | grep -qi 'refusing to delete it' || { echo "FAIL: no actionable refusal message" >&2; printf '%s\n' "$out" >&2; exit 1; }
+test -d "$link" || { echo "FAIL: skills/LifeOS was removed despite refusal" >&2; exit 1; }
+grep -q 'must survive' "$link/SKILL.md" || { echo "FAIL: user content was destroyed" >&2; exit 1; }
+rm -rf "$link"; ln -s ../LifeOS "$link"       # restore the loader symlink
+echo "OK 09d_skills_migration_refuses"
+CASE
+)"
+
+# 09e journaled-but-unenrolled singletons recover on resume -------------------
+c09e="$(write_case 09e_singleton_recovery <<'CASE'
+set -euo pipefail
+source "$LP_E2E_ENV"
+cd "$LP_INSTALL"
+# Simulate a crash that wrote settings.json + package.json but never persisted
+# state (e.g. bun install failed): drop their state keys, journal them, set the
+# marker. The resumed deploy must re-process and re-enroll them, not preserve.
+python3 - <<'PY'
+import json
+st = json.load(open('.lifeos-deploy-state.json'))
+st['files'].pop('settings.json', None); st['files'].pop('package.json', None)
+json.dump(st, open('.lifeos-deploy-state.json','w'), indent=2)
+json.dump({'version':1,'keys':['settings.json','package.json']}, open('.lifeos-deploy-journal.json','w'))
+open('.lifeos-deploy-inprogress','w').write('x\n')
+PY
+out="$(bun bin/deploy.ts --apply 2>&1)"
+printf '%s\n' "$out"
+grep -q 'Deploy complete' <<<"$out"
+grep -qi 'settings.json  RESUMED' <<<"$out" || { echo "FAIL: settings.json not resumed" >&2; exit 1; }
+grep -qi 'package.json resumed' <<<"$out" || { echo "FAIL: package.json not resumed" >&2; exit 1; }
+python3 - <<'PY'
+import json, sys, os
+st = json.load(open('.lifeos-deploy-state.json'))
+for k in ('settings.json','package.json'):
+    if k not in st['files']: print('FAIL: %s not re-enrolled' % k); sys.exit(1)
+if os.path.exists('.lifeos-deploy-journal.json'): print('FAIL: journal not cleared'); sys.exit(1)
+if os.path.exists('.lifeos-deploy-inprogress'): print('FAIL: marker not cleared'); sys.exit(1)
+print('singleton recovery OK')
+PY
+echo "OK 09e_singleton_recovery"
+CASE
+)"
+
 # 10 delete -------------------------------------------------------------------
 c10="$(write_case 10_delete <<'CASE'
 set -euo pipefail
@@ -678,6 +735,8 @@ run_case "$P_MAIN" 08_update_happy     "$c08"
 run_case "$P_MAIN" 09_update_dirty_guard "$c09"
 run_case "$P_MAIN" 09b_journal_recovery "$c09b"
 run_case "$P_MAIN" 09c_skills_migration "$c09c"
+run_case "$P_MAIN" 09d_skills_migration_refuses "$c09d"
+run_case "$P_MAIN" 09e_singleton_recovery "$c09e"
 run_case "$P_MAIN" 10_delete           "$c10"
 
 # ── report ─────────────────────────────────────────────────────────────

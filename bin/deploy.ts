@@ -82,6 +82,12 @@ const INPROGRESS_PATH = join(CR, ".lifeos-deploy-inprogress");
 // saveDeployState succeeds; a resume with no journal (or an unreadable one)
 // re-processes nothing, which is the safe default. Per-install state, gitignored.
 const JOURNAL_PATH = join(CR, ".lifeos-deploy-journal.json");
+// The live write-ahead journal set for the current --apply, armed once
+// applyDeploy starts. die() flushes it before exiting so EVERY failure path
+// (a mid-tree copy failure, a failed `bun install`, a missing dep) leaves an
+// accurate on-disk record of the files this run had already written — which a
+// resume then re-processes. Null during dry-run (nothing is written).
+let ACTIVE_JOURNAL: Set<string> | null = null;
 
 // ── args ──────────────────────────────────────────────────────────────
 const argv = process.argv.slice(2);
@@ -94,6 +100,15 @@ function log(msg = ""): void {
 }
 function die(msg: string): never {
   console.error(`\nFATAL: ${msg}`);
+  // Flush the write-ahead journal before aborting so a resume knows exactly
+  // which managed files this interrupted run had already written (and must
+  // re-process) — never leaving them stranded raw or misclassified as user
+  // files. Best-effort; a journal-write failure must not mask the real error.
+  if (ACTIVE_JOURNAL) {
+    try {
+      saveJournal(ACTIVE_JOURNAL);
+    } catch {}
+  }
   process.exit(1);
 }
 
@@ -405,6 +420,7 @@ function syncManagedTree(
         cpSync(s, d);
         result.copied++;
         result.written.push(d);
+        if (ACTIVE_JOURNAL) ACTIVE_JOURNAL.add(key);
         return;
       }
 
@@ -414,6 +430,7 @@ function syncManagedTree(
         cpSync(s, d);
         result.updated++;
         result.written.push(d);
+        if (ACTIVE_JOURNAL) ACTIVE_JOURNAL.add(key);
         return;
       }
 
@@ -425,6 +442,7 @@ function syncManagedTree(
         cpSync(s, d);
         result.copied++;
         result.written.push(d);
+        if (ACTIVE_JOURNAL) ACTIVE_JOURNAL.add(key);
         return;
       }
 
@@ -835,8 +853,11 @@ function applyDeploy(version: string, bunBin: string, bunDir: string): void {
   const pathRewriteFiles: string[] = [];
   const tokenFiles: string[] = [];
   const managedWritten: string[] = [];
-  // This run's write-ahead journal, persisted after each file-writing step.
+  // This run's write-ahead journal, persisted after each file-writing step and
+  // flushed by die() on any failure path. Arm it module-side so die() and
+  // syncManagedTree (journal-on-write) reach the same set.
   const journal = new Set<string>();
+  ACTIVE_JOURNAL = journal;
   const recordJournal = (paths: string[]): void => {
     for (const p of paths) journal.add(relativeKey(p));
     saveJournal(journal);
@@ -890,17 +911,41 @@ function applyDeploy(version: string, bunBin: string, bunDir: string): void {
       // install/skills/LifeOS/ as a real directory and enrolled its files in
       // state; stale-cleanup removes managed FILES but never their DIRS, so the
       // now-empty dir would permanently block the `../LifeOS` symlink and disable
-      // the loader. Also covers a wrong-target symlink or a stray file. Remove it,
-      // purge any enrolled `skills/LifeOS/**` keys (and mark them seen so
-      // stale-cleanup does not later walk them THROUGH the fresh symlink), then
-      // create the loader symlink.
+      // the loader. Migrate it to the symlink — but PRESERVATION FIRST: only
+      // auto-delete a directory every file of which is a deploy-managed file
+      // still matching its recorded hash (a pristine old-format copy). A user's
+      // custom skills/LifeOS, or a managed dir carrying local edits, must never
+      // be silently deleted — stop with an actionable error instead.
+      const wasSymlink = linkStat.isSymbolicLink();
+      const wasDir = linkStat.isDirectory() && !wasSymlink;
+      if (wasDir) {
+        const offenders: string[] = [];
+        for (const f of walkFiles(link)) {
+          const k = relativeKey(f);
+          if (previous.files[k] === undefined || hashFile(f) !== previous.files[k]) {
+            offenders.push(k);
+            if (offenders.length >= 5) break;
+          }
+        }
+        if (offenders.length) {
+          die(`skills/LifeOS is a directory with unmanaged or locally-modified file(s) ` +
+            `(e.g. ${offenders[0]}) — refusing to delete it. Back it up and remove it ` +
+            `manually to enable the ../LifeOS loader symlink.`);
+        }
+      } else if (!wasSymlink) {
+        die(`skills/LifeOS is an unexpected regular file — remove it manually to ` +
+          `enable the ../LifeOS loader symlink.`);
+      }
+      // Safe: a fully-managed old-format dir, or a wrong-target symlink (never
+      // user data). Purge any enrolled `skills/LifeOS/**` keys (and mark them
+      // seen so stale-cleanup does not later walk them THROUGH the fresh
+      // symlink), then create the loader symlink.
       for (const k of Object.keys(previous.files)) {
         if (k === "skills/LifeOS" || k.startsWith("skills/LifeOS/")) {
           delete nextFiles[k];
           seen.add(k);
         }
       }
-      const wasDir = linkStat.isDirectory() && !linkStat.isSymbolicLink();
       rmSync(link, { recursive: true, force: true });
       mkdirSync(dirname(link), { recursive: true });
       symlinkSync("../LifeOS", link); // relative → <CR>/LifeOS
@@ -988,6 +1033,7 @@ function applyDeploy(version: string, bunBin: string, bunDir: string): void {
     seen.add(key);
     if (!existsSync(settingsPath)) {
       writeFileSync(settingsPath, json);
+      recordJournal([settingsPath]);
       log(`  6. settings.json  CREATED (${strippedHooks} SessionStart backport hook(s) stripped; ${rewrites} path rewrite(s); env expanded)${FULL ? "; +statusLine +spinner" : ""}`);
       row("6 settings.json", "created", "", rewrites, FULL ? "full: statusLine+spinner" : "");
       nextFiles[key] = hashFile(settingsPath);
@@ -997,10 +1043,22 @@ function applyDeploy(version: string, bunBin: string, bunDir: string): void {
         row("6 settings.json", "-", "current");
       } else {
         writeFileSync(settingsPath, json);
+        recordJournal([settingsPath]);
         log(`  6. settings.json  UPDATED (${strippedHooks} SessionStart backport hook(s) stripped; ${rewrites} path rewrite(s); env expanded)${FULL ? "; +statusLine +spinner" : ""}`);
         row("6 settings.json", "updated", "", rewrites, FULL ? "full: statusLine+spinner" : "");
       }
       nextFiles[key] = hashFile(settingsPath);
+    } else if (priorJournal.has(key)) {
+      // Crash recovery: a prior interrupted run wrote settings.json but never
+      // persisted deploy state (e.g. `bun install` failed after this step), so
+      // it is journaled but unenrolled. Regenerate from payload and enroll —
+      // plain preserve semantics would strand it (never enhanced by --full,
+      // never refreshed).
+      writeFileSync(settingsPath, json);
+      recordJournal([settingsPath]);
+      nextFiles[key] = hashFile(settingsPath);
+      log(`  6. settings.json  RESUMED (rewritten from payload; ${rewrites} path rewrite(s))`);
+      row("6 settings.json", "resumed", "", rewrites);
     } else {
       delete nextFiles[key];
       log(`  6. settings.json  locally modified or pre-existing → preserved`);
@@ -1087,10 +1145,20 @@ function applyDeploy(version: string, bunBin: string, bunDir: string): void {
       cpSync(pkgSrc, pkgDst);
       nextFiles[key] = hashFile(pkgDst);
       note = "refreshed";
+    } else if (priorJournal.has(key)) {
+      // Crash recovery: journaled by a prior interrupted run (bun install failed
+      // here last time) but never enrolled. Refresh from payload and enroll so
+      // future dependency bumps are picked up, instead of preserving it forever.
+      cpSync(pkgSrc, pkgDst);
+      nextFiles[key] = hashFile(pkgDst);
+      note = "resumed";
     } else {
       delete nextFiles[key];
       note = "preserved";
     }
+    // Journal package.json BEFORE the fallible `bun install`, so an install
+    // failure still leaves it recoverable rather than stranded pre-existing.
+    if (note !== "preserved") recordJournal([pkgDst]);
     log(` 12. deps           package.json ${note}; running bun install...`);
     const proc = Bun.spawnSync(["bun", "install"], { cwd: CR, stdout: "pipe", stderr: "pipe" });
     if (proc.exitCode !== 0) {

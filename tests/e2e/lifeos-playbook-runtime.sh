@@ -51,11 +51,16 @@ BUN="$(command -v bun)"
 CPB="$(command -v claude-playbook)"
 REAL_HOME="$HOME"
 
-# Source under test. Defaults target the primary checkout's packaging branch;
-# override with LP_E2E_SOURCE / LP_E2E_BRANCH to test another branch or a
-# throwaway repo (parity with the lifecycle suite's LP_E2E_SOURCE/LP_E2E_BRANCH).
-SRC_URL="${LP_E2E_SOURCE:-file:///Users/polat/DEV/LifeOS}"
-SRC_BRANCH="${LP_E2E_BRANCH:-claude/playbook-install}"
+# Source under test — derived from THIS checkout so the suite is portable (CI,
+# other contributors), matching the lifecycle suite. REPO_ROOT is where the
+# suite lives; PRIMARY_CHECKOUT owns the shared object store (works from a
+# linked worktree); SRC_BRANCH is the current branch. Override either with
+# LP_E2E_SOURCE / LP_E2E_BRANCH to test another branch or a throwaway repo.
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+GIT_COMMON="$(git -C "$REPO_ROOT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+PRIMARY_CHECKOUT="$(cd "$(dirname "${GIT_COMMON:-$REPO_ROOT/.git}")" && pwd)"
+SRC_URL="${LP_E2E_SOURCE:-file://$PRIMARY_CHECKOUT}"
+SRC_BRANCH="${LP_E2E_BRANCH:-$(git -C "$REPO_ROOT" branch --show-current)}"
 
 KEEP_PANES="${LP_E2E_KEEP_PANES:-0}"
 KEEP_TMP="${LP_E2E_KEEP_TMP:-0}"
