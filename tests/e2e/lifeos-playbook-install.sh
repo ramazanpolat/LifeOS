@@ -618,72 +618,70 @@ echo "OK 09b_journal_recovery (i re-processed, ii re-enrolled, iii preserved)"
 CASE
 )"
 
-# 09c old-format skills/LifeOS dir → symlink migration (P2-4) ------------------
-c09c="$(write_case 09c_skills_migration <<'CASE'
+# 09c the stock LifeOS installer skill is NOT deployed (P1-1) ------------------
+c09c="$(write_case 09c_skills_not_deployed <<'CASE'
 set -euo pipefail
 source "$LP_E2E_ENV"
 cd "$LP_INSTALL"
-# An install made by the OLD deployer has skills/LifeOS as a COPIED DIRECTORY
-# enrolled in state, not the ../LifeOS loader symlink. Its managed FILES get
-# stale-cleaned but the now-empty DIR would permanently block the symlink → the
-# loader stays disabled. Simulate that starting state and deploy: the symlink
-# step must migrate the copied dir → the loader symlink and purge its
-# skills/LifeOS/** state keys.
+# P1-1 reverses the round-3 loader-symlink decision. bin/deploy.ts IS the
+# installer, so the stock skills/LifeOS installer skill (/lifeos-setup) is a
+# footgun (its Setup workflow runs DeployCore/ScaffoldUser against the tracked
+# LifeOS/ payload on case-insensitive macOS). It is therefore NOT deployed: a
+# fresh deploy leaves NO skills/LifeOS; a redeploy keeps it absent. Interview (a
+# SEPARATE skill) is still deployed, so onboarding is unaffected.
+{ [ ! -e skills/LifeOS ] && [ ! -L skills/LifeOS ]; } || { echo "FAIL: skills/LifeOS present after deploy" >&2; ls -la skills/LifeOS >&2; exit 1; }
+test -s skills/Interview/SKILL.md || { echo "FAIL: Interview skill not deployed" >&2; exit 1; }
+out="$(bun bin/deploy.ts --apply 2>&1)"
+grep -q 'Deploy complete' <<<"$out" || { echo "FAIL: redeploy did not complete" >&2; printf '%s\n' "$out" >&2; exit 1; }
+grep -qi 'skills/LifeOS absent' <<<"$out" || { echo "FAIL: expected 'skills/LifeOS absent' note" >&2; printf '%s\n' "$out" >&2; exit 1; }
+{ [ ! -e skills/LifeOS ] && [ ! -L skills/LifeOS ]; } || { echo "FAIL: skills/LifeOS reappeared after redeploy" >&2; exit 1; }
+test "$(git status --porcelain)" = " M .playbook" || { echo "FAIL: tree not clean-except-.playbook:" >&2; git status --porcelain >&2; exit 1; }
+echo "OK 09c_skills_not_deployed"
+CASE
+)"
+
+# 09d deployer-owned skills/LifeOS leftover is REMOVED on update (P1-1) --------
+c09d="$(write_case 09d_skills_managed_dir_removed <<'CASE'
+set -euo pipefail
+source "$LP_E2E_ENV"
+cd "$LP_INSTALL"
+# A prior (round-3) deploy left skills/LifeOS as EITHER a copied dir OR the
+# ../LifeOS loader symlink, enrolled in state. P1-1 now cleans up a DEPLOYER-OWNED
+# leftover — (a) the ../LifeOS loader symlink, or (b) a directory every descendant
+# of which is a deploy-managed, hash-matching REGULAR file — removing it and
+# purging its state keys, with the deploy completing. Never touches user content.
 link="skills/LifeOS"
-test -L "$link"                                   # currently the correct symlink
-rm "$link"
-mkdir -p "$link"
-printf 'STALE COPIED SNAPSHOT — must be replaced\n' > "$link/SKILL.md"
-printf 'x\n' > "$link/extra-old-file.ts"
+# --- (b) old-format fully-managed dir → removed + keys purged ---
+rm -rf "$link"; mkdir -p "$link/Tools"
+printf 'STALE MANAGED SNAPSHOT\n' > "$link/SKILL.md"
+printf 'export const x = 1\n' > "$link/Tools/Old.ts"
 python3 - <<'PY'
 import json, hashlib
 st = json.load(open('.lifeos-deploy-state.json'))
-for rel in ('skills/LifeOS/SKILL.md', 'skills/LifeOS/extra-old-file.ts'):
+for rel in ('skills/LifeOS/SKILL.md', 'skills/LifeOS/Tools/Old.ts'):
     st['files'][rel] = hashlib.sha256(open(rel, 'rb').read()).hexdigest()   # enroll, as the old deployer did
 json.dump(st, open('.lifeos-deploy-state.json', 'w'), indent=2)
 PY
 out="$(bun bin/deploy.ts --apply 2>&1)"
 printf '%s\n' "$out"
-grep -q 'Deploy complete' <<<"$out"
-grep -qi 'skills/LifeOS migrated' <<<"$out" || { echo "FAIL: no migration message emitted" >&2; exit 1; }
-# Now the loader symlink → the LIVE repo-root skill (not a stale copy).
-test -L "$link" || { echo "FAIL: skills/LifeOS is not a symlink after migration" >&2; ls -la "$link" >&2; exit 1; }
-test "$(readlink "$link")" = "../LifeOS" || { echo "FAIL: symlink target is $(readlink "$link"), want ../LifeOS" >&2; exit 1; }
-diff -q "$link/SKILL.md" LifeOS/SKILL.md >/dev/null || { echo "FAIL: skills/LifeOS/SKILL.md is not the live repo-root SKILL.md" >&2; exit 1; }
-if grep -q 'STALE COPIED SNAPSHOT' "$link/SKILL.md"; then echo "FAIL: stale snapshot survived migration" >&2; exit 1; fi
-# The copied-dir state keys were purged.
+grep -q 'Deploy complete' <<<"$out" || { echo "FAIL: deploy did not complete" >&2; exit 1; }
+grep -qi 'deployer-managed old-format dir removed' <<<"$out" || { echo "FAIL: no managed-dir-removed message" >&2; exit 1; }
+{ [ ! -e "$link" ] && [ ! -L "$link" ]; } || { echo "FAIL: managed skills/LifeOS dir not removed" >&2; ls -la "$link" >&2; exit 1; }
 python3 - <<'PY'
 import json, sys
 st = json.load(open('.lifeos-deploy-state.json'))
 leftover = [k for k in st['files'] if k == 'skills/LifeOS' or k.startswith('skills/LifeOS/')]
 if leftover: print('FAIL: skills/LifeOS/** keys not purged: %s' % leftover); sys.exit(1)
-print('state keys purged OK')
+print('managed-dir state keys purged OK')
 PY
-test "$(git status --porcelain)" = " M .playbook" || { echo "FAIL: tree not clean-except-.playbook after migration:" >&2; git status --porcelain >&2; exit 1; }
-echo "OK 09c_skills_migration"
-CASE
-)"
-
-# 09d migration REFUSES to delete unmanaged skills/LifeOS content ------------
-c09d="$(write_case 09d_skills_migration_refuses <<'CASE'
-set -euo pipefail
-source "$LP_E2E_ENV"
-cd "$LP_INSTALL"
-link="skills/LifeOS"
-# Replace the loader symlink with an UNMANAGED directory (a custom user skill,
-# or a managed dir carrying local edits). The migration must REFUSE to delete
-# it and stop with an actionable error, preserving the content.
-rm -f "$link"; mkdir -p "$link"
-printf 'my custom LifeOS skill — must survive\n' > "$link/SKILL.md"
-if out="$(bun bin/deploy.ts --apply 2>&1)"; then
-  echo "FAIL: deploy did not refuse to delete unmanaged skills/LifeOS" >&2
-  printf '%s\n' "$out" >&2; exit 1
-fi
-printf '%s\n' "$out" | grep -qi 'refusing to delete it' || { echo "FAIL: no actionable refusal message" >&2; printf '%s\n' "$out" >&2; exit 1; }
-test -d "$link" || { echo "FAIL: skills/LifeOS was removed despite refusal" >&2; exit 1; }
-grep -q 'must survive' "$link/SKILL.md" || { echo "FAIL: user content was destroyed" >&2; exit 1; }
-rm -rf "$link"; ln -s ../LifeOS "$link"       # restore the loader symlink
-echo "OK 09d_skills_migration_refuses"
+# --- (a) the ../LifeOS loader symlink shape is removed the same way ---
+ln -s ../LifeOS "$link"
+out2="$(bun bin/deploy.ts --apply 2>&1)"
+grep -q 'Deploy complete' <<<"$out2" || { echo "FAIL: symlink-removal deploy did not complete" >&2; printf '%s\n' "$out2" >&2; exit 1; }
+grep -qi 'loader symlink removed' <<<"$out2" || { echo "FAIL: no loader-symlink-removed message" >&2; printf '%s\n' "$out2" >&2; exit 1; }
+{ [ ! -L "$link" ] && [ ! -e "$link" ]; } || { echo "FAIL: ../LifeOS loader symlink not removed" >&2; exit 1; }
+test "$(git status --porcelain)" = " M .playbook" || { echo "FAIL: tree not clean-except-.playbook:" >&2; git status --porcelain >&2; exit 1; }
+echo "OK 09d_skills_managed_dir_removed"
 CASE
 )"
 
@@ -722,89 +720,71 @@ echo "OK 09e_singleton_recovery"
 CASE
 )"
 
-# 09f migrate-then-crash: purge stale skills/LifeOS state in the already-symlink
-#     branch too (P1-1) --------------------------------------------------------
-c09f="$(write_case 09f_skills_symlink_crash_purge <<'CASE'
+# 09f UNMANAGED custom skills/LifeOS is LEFT UNTOUCHED — no refusal (P1-1) ------
+c09f="$(write_case 09f_skills_unmanaged_left_untouched <<'CASE'
 set -euo pipefail
 source "$LP_E2E_ENV"
 cd "$LP_INSTALL"
-# P1-1: a prior run migrated skills/LifeOS to the ../LifeOS loader symlink but
-# crashed before saveDeployState, so stale skills/LifeOS/** entries linger in the
-# state while skills/LifeOS is ALREADY the correct symlink (branch a). Without the
-# P1-1 purge in the already-symlink branch, removeStaleManagedFiles later walks
-# those entries THROUGH the symlink (assertSafeDestination) and aborts EVERY
-# future deploy.
+# P1-1: a skills/LifeOS that is NOT deployer-owned (a custom user skill; an
+# unenrolled dir) is USER CONTENT — the deploy must LEAVE IT UNTOUCHED and still
+# succeed. This reverses the round-3 refuse-and-die behavior: no refusal, no
+# non-zero exit, no deletion.
 link="skills/LifeOS"
-test -L "$link"                                        # already the loader symlink
-test "$(readlink "$link")" = "../LifeOS"
-# Inject stale skills/LifeOS/** state keys (bogus hashes; as regular files these
-# would only resolve THROUGH the symlink, which is the abort trap).
-python3 - <<'PY'
-import json
-st = json.load(open('.lifeos-deploy-state.json'))
-st['files']['skills/LifeOS'] = 'a'*64
-st['files']['skills/LifeOS/SKILL.md'] = 'b'*64
-st['files']['skills/LifeOS/Tools/Old.ts'] = 'c'*64
-json.dump(st, open('.lifeos-deploy-state.json','w'), indent=2)
-PY
-out="$(bun bin/deploy.ts --apply 2>&1)"
+rm -rf "$link"; mkdir -p "$link"
+printf 'my custom LifeOS skill — must survive\n' > "$link/SKILL.md"   # NOT enrolled
+out="$(bun bin/deploy.ts --apply 2>&1)"   # must NOT fail
 printf '%s\n' "$out"
-grep -q 'Deploy complete' <<<"$out" || { echo "FAIL: deploy aborted (P1-1 not fixed → stale symlink state trips removeStaleManagedFiles)" >&2; exit 1; }
-grep -qi 'skills/LifeOS symlink OK' <<<"$out" || { echo "FAIL: expected the already-symlink (branch a) path" >&2; exit 1; }
-# The stale keys were purged from the persisted state.
-python3 - <<'PY'
-import json, sys
-st = json.load(open('.lifeos-deploy-state.json'))
-leftover = [k for k in st['files'] if k == 'skills/LifeOS' or k.startswith('skills/LifeOS/')]
-if leftover: print('FAIL: stale skills/LifeOS/** keys not purged: %s' % leftover); sys.exit(1)
-print('stale keys purged OK')
-PY
-test -L "$link" && test "$(readlink "$link")" = "../LifeOS"
+grep -q 'Deploy complete' <<<"$out" || { echo "FAIL: deploy did not complete on unmanaged skills/LifeOS" >&2; exit 1; }
+grep -qi 'left untouched (unmanaged user content)' <<<"$out" || { echo "FAIL: no left-untouched note" >&2; printf '%s\n' "$out" >&2; exit 1; }
+if grep -qi 'refusing' <<<"$out"; then echo "FAIL: deploy refused instead of leaving user content untouched" >&2; exit 1; fi
+test -d "$link" || { echo "FAIL: custom skills/LifeOS was removed" >&2; exit 1; }
+grep -q 'must survive' "$link/SKILL.md" || { echo "FAIL: user content destroyed" >&2; exit 1; }
+rm -rf "$link"          # restore: not deployed, so nothing to put back
 test "$(git status --porcelain)" = " M .playbook" || { echo "FAIL: tree not clean-except-.playbook:" >&2; git status --porcelain >&2; exit 1; }
-echo "OK 09f_skills_symlink_crash_purge"
+echo "OK 09f_skills_unmanaged_left_untouched"
 CASE
 )"
 
-# 09g migration REFUSES to delete an old dir hiding a nested symlink (P1-2) -----
-c09g="$(write_case 09g_skills_nested_symlink_refuses <<'CASE'
+# 09g UNMANAGED dir hiding a nested symlink is LEFT UNTOUCHED (P1-1) ------------
+c09g="$(write_case 09g_skills_nested_symlink_left_untouched <<'CASE'
 set -euo pipefail
 source "$LP_E2E_ENV"
 cd "$LP_INSTALL"
-# P1-2: an old-format COPIED skills/LifeOS whose regular files are all managed +
-# hash-matching, BUT which hides a user-added SYMLINK. walkFiles() skips symlinks,
-# so the pre-fix "fully managed?" check judged the dir deletable and the recursive
-# rmSync would destroy the user symlink. The fix inspects EVERY entry recursively
-# and REFUSES.
+# P1-1: a skills/LifeOS dir whose regular files are all deploy-managed +
+# hash-matching BUT which hides a user-added SYMLINK is NOT deployer-owned —
+# firstUnmanagedEntry inspects EVERY entry recursively (walkFiles would skip the
+# symlink). It must be LEFT UNTOUCHED: dir, nested symlink, AND the enrolled
+# regular file all survive. Crucially the enrolled regular file must NOT be
+# deleted by removeStaleManagedFiles: the deploy purges (marks seen) every
+# skills/LifeOS/** state key when the path is present — in the leave-untouched
+# branch too — so a preserved dir is never mutilated.
 link="skills/LifeOS"
-rm -f "$link"; mkdir -p "$link/Tools"
-printf 'STALE MANAGED SNAPSHOT\n' > "$link/SKILL.md"          # managed, hash-matching
-ln -s /etc/hosts "$link/Tools/user-link"                      # nested user symlink
+rm -rf "$link"; mkdir -p "$link/Tools"
+printf 'MANAGED SNAPSHOT\n' > "$link/SKILL.md"          # managed, hash-matching
+ln -s /etc/hosts "$link/Tools/user-link"                # nested user symlink
 python3 - <<'PY'
 import json, hashlib
 st = json.load(open('.lifeos-deploy-state.json'))
 st['files']['skills/LifeOS/SKILL.md'] = hashlib.sha256(open('skills/LifeOS/SKILL.md','rb').read()).hexdigest()
 json.dump(st, open('.lifeos-deploy-state.json','w'), indent=2)
 PY
-if out="$(bun bin/deploy.ts --apply 2>&1)"; then
-  echo "FAIL: deploy did not refuse an old dir hiding a nested symlink" >&2
-  printf '%s\n' "$out" >&2; exit 1
-fi
-printf '%s\n' "$out" | grep -qi 'refusing to delete it' || { echo "FAIL: no actionable refusal message" >&2; printf '%s\n' "$out" >&2; exit 1; }
-printf '%s\n' "$out" | grep -qi 'non-regular' || { echo "FAIL: refusal did not cite a non-regular/symlink entry" >&2; printf '%s\n' "$out" >&2; exit 1; }
-test -L "$link/Tools/user-link" || { echo "FAIL: nested user symlink was deleted despite refusal" >&2; exit 1; }
-grep -q 'STALE MANAGED SNAPSHOT' "$link/SKILL.md" || { echo "FAIL: dir content destroyed despite refusal" >&2; exit 1; }
-# Restore the loader symlink + injected state key + clear the crash breadcrumbs
-# the refusal (a die() in step 1) left behind, so later cases start clean.
-rm -rf "$link"; ln -s ../LifeOS "$link"
-rm -f .lifeos-deploy-inprogress .lifeos-deploy-journal.json
+out="$(bun bin/deploy.ts --apply 2>&1)"   # must NOT die / must NOT refuse
+printf '%s\n' "$out"
+grep -q 'Deploy complete' <<<"$out" || { echo "FAIL: deploy did not complete (a dir hiding a symlink must be left untouched, not refused)" >&2; exit 1; }
+grep -qi 'left untouched (unmanaged user content)' <<<"$out" || { echo "FAIL: no left-untouched note" >&2; printf '%s\n' "$out" >&2; exit 1; }
+if grep -qi 'refusing' <<<"$out"; then echo "FAIL: deploy refused instead of leaving user content untouched" >&2; exit 1; fi
+test -L "$link/Tools/user-link" || { echo "FAIL: nested user symlink was deleted" >&2; exit 1; }
+{ test -f "$link/SKILL.md" && grep -q 'MANAGED SNAPSHOT' "$link/SKILL.md"; } || { echo "FAIL: enrolled SKILL.md inside the preserved dir was destroyed (stale-cleanup mutilation)" >&2; exit 1; }
 python3 - <<'PY'
-import json
+import json, sys
 st = json.load(open('.lifeos-deploy-state.json'))
-st['files'].pop('skills/LifeOS/SKILL.md', None)
-json.dump(st, open('.lifeos-deploy-state.json','w'), indent=2)
+leftover = [k for k in st['files'] if k == 'skills/LifeOS' or k.startswith('skills/LifeOS/')]
+if leftover: print('FAIL: skills/LifeOS/** keys not purged: %s' % leftover); sys.exit(1)
+print('state keys purged OK')
 PY
-test "$(git status --porcelain)" = " M .playbook" || { echo "FAIL: tree not clean-except-.playbook after refusal case:" >&2; git status --porcelain >&2; exit 1; }
-echo "OK 09g_skills_nested_symlink_refuses"
+rm -rf "$link"          # restore: not deployed
+test "$(git status --porcelain)" = " M .playbook" || { echo "FAIL: tree not clean-except-.playbook:" >&2; git status --porcelain >&2; exit 1; }
+echo "OK 09g_skills_nested_symlink_left_untouched"
 CASE
 )"
 
@@ -831,6 +811,34 @@ test "$(mode_of "$dep")" = "755" || { echo "FAIL: deployed hook $dep mode=$(mode
 test "$(git status --porcelain)" = " M .playbook" || { echo "FAIL: tree not clean-except-.playbook:" >&2; git status --porcelain >&2; exit 1; }
 rm -f "$custom"
 echo "OK 09h_user_hook_chmod_preserved"
+CASE
+)"
+
+# 09i chmod does NOT touch a preserved user-customized statusline (P2-4) --------
+c09i="$(write_case 09i_statusline_chmod_preserved <<'CASE'
+set -euo pipefail
+source "$LP_E2E_ENV"
+cd "$LP_INSTALL"
+# P2-4: chmodExecutables must chmod LIFEOS_StatusLine.sh ONLY when THIS deploy
+# wrote it (its relativeKey in the managed-written set) — the same gate the hooks
+# already got. A user-customized copy the sync PRESERVED (content changed → hash
+# != enrolled → not re-written) must keep its mode. Plant a modified 0644
+# statusline and redeploy: it stays 0644 and its content survives. (A prior
+# --full deploy — case 07 — put the statusline on disk with full inherited via
+# state.)
+sl="runtime/LIFEOS/LIFEOS_StatusLine.sh"
+test -f "$sl" || { echo "FAIL: statusline not deployed (expected from the earlier --full)" >&2; exit 1; }
+mode_of() { python3 -c 'import os,sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777)[2:])' "$1"; }
+printf '\n# user customization line\n' >> "$sl"      # content now differs from enrolled → preserved
+chmod 0644 "$sl"
+test "$(mode_of "$sl")" = "644"
+out="$(bun bin/deploy.ts --apply --full 2>&1)"
+grep -q 'Deploy complete' <<<"$out" || { echo "FAIL: deploy did not complete" >&2; printf '%s\n' "$out" >&2; exit 1; }
+test "$(mode_of "$sl")" = "644" || { echo "FAIL: preserved statusline mode=$(mode_of "$sl"), want 644 (P2-4 not fixed)" >&2; exit 1; }
+grep -q '# user customization line' "$sl" || { echo "FAIL: user statusline content overwritten" >&2; exit 1; }
+# runtime/ is gitignored, so the modified statusline never dirties the tracked tree.
+test "$(git status --porcelain)" = " M .playbook" || { echo "FAIL: tree not clean-except-.playbook:" >&2; git status --porcelain >&2; exit 1; }
+echo "OK 09i_statusline_chmod_preserved"
 CASE
 )"
 
@@ -862,12 +870,13 @@ run_case "$P_AUX"  07b_full_fresh      "$c07b"
 run_case "$P_MAIN" 08_update_happy     "$c08"
 run_case "$P_MAIN" 09_update_dirty_guard "$c09"
 run_case "$P_MAIN" 09b_journal_recovery "$c09b"
-run_case "$P_MAIN" 09c_skills_migration "$c09c"
-run_case "$P_MAIN" 09d_skills_migration_refuses "$c09d"
+run_case "$P_MAIN" 09c_skills_not_deployed "$c09c"
+run_case "$P_MAIN" 09d_skills_managed_dir_removed "$c09d"
 run_case "$P_MAIN" 09e_singleton_recovery "$c09e"
-run_case "$P_MAIN" 09f_skills_symlink_crash_purge "$c09f"
-run_case "$P_MAIN" 09g_skills_nested_symlink_refuses "$c09g"
+run_case "$P_MAIN" 09f_skills_unmanaged_left_untouched "$c09f"
+run_case "$P_MAIN" 09g_skills_nested_symlink_left_untouched "$c09g"
 run_case "$P_MAIN" 09h_user_hook_chmod_preserved "$c09h"
+run_case "$P_MAIN" 09i_statusline_chmod_preserved "$c09i"
 run_case "$P_MAIN" 10_delete           "$c10"
 
 # ── report ─────────────────────────────────────────────────────────────

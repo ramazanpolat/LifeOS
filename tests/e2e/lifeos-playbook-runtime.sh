@@ -11,9 +11,15 @@
 #
 # Philosophy: assert playbook PACKAGING invariants. Upstream quirks are in scope
 # only as "must be preserved verbatim" (porting fidelity), never as things to
-# fix. Known-accepted and NOT flagged: *.plist.template keep ~/.claude (launchd,
-# unwired); PULSE/** internals keep home forms (unwired service);
-# {{DA_NAME}}/{{PRINCIPAL_NAME}} placeholders remain until the Interview.
+# fix. Known-accepted and NOT flagged: the TOOLS *.plist.template files keep
+# __HOME__/~/.claude (last-segment ext .template, out of TEXT_EXT — each is
+# materialized against the real ~/.claude by its OWN installer, out of P1-2's
+# scope); {{DA_NAME}}/{{PRINCIPAL_NAME}} placeholders remain until the Interview.
+# NOTE (P1-2/P1-3): the PULSE launchd/systemd service templates (.plist/.service)
+# and PULSE code paths are now LOCALIZED to the config root — no longer left on
+# home forms. Their __HOME__/.claude and `process.env.HOME ?? "~"`-before-.claude
+# escapes are rewritten (see case 16); a bare __HOME__ used for a non-.claude path
+# is preserved for Pulse's own substitution.
 #
 # Harness: driven through a real herdr pane in a DEDICATED workspace
 # (lifeos-e2e-runtime). Cases run in that pane; completion is detected via a
@@ -200,7 +206,7 @@ def sweep(L):
              os.path.join(L, 'skills'), os.path.join(L, 'agents')]
     e = []
     for root in roots:
-        for dp, dirs, fs in os.walk(root):  # os.walk does not follow the skills/LifeOS symlink
+        for dp, dirs, fs in os.walk(root):  # os.walk does not follow symlinks (skills/LifeOS is no longer deployed)
             if 'node_modules' in dirs: dirs.remove('node_modules')
             for f in fs:
                 if not f.endswith(exts): continue
@@ -595,22 +601,28 @@ echo "r6-configroot-lifeos OK (0 stragglers, health check clean, payload untouch
 CASE
 run_case 11_r6_configroot_lifeos "$F"
 
-# ── 12. skills/LifeOS loader symlink (P1-b) ─────────────────────────────────
-# skills/LifeOS must be a SYMLINK → ../LifeOS (the LIVE repo-root skill), not a
-# copied stale snapshot, and its SKILL.md must resolve through the link.
-F="$CMD_DIR/12_skills_loader_symlink.sh"
-write_case 12_skills_loader_symlink >/dev/null <<'CASE'
+# ── 12. skills/LifeOS is NOT deployed (P1-1) ────────────────────────────────
+# The stock LifeOS installer skill is intentionally NOT deployed (reversing
+# round-3's loader-symlink decision): bin/deploy.ts IS the installer, and the
+# stock /lifeos-setup skill is both redundant AND a footgun — its Setup workflow
+# runs DeployCore/ScaffoldUser against <configRoot>/LIFEOS, which on
+# case-insensitive macOS IS the tracked LifeOS/ payload, corrupting the checkout.
+# Assert skills/LifeOS is ABSENT after a fresh deploy. Onboarding is unaffected:
+# Interview is a SEPARATE skill and is still deployed.
+F="$CMD_DIR/12_skills_not_deployed.sh"
+write_case 12_skills_not_deployed >/dev/null <<'CASE'
 set -euo pipefail
 source "$LP_RUN/env.sh"
-test -L "$L/skills/LifeOS" || { echo "skills/LifeOS is not a symlink" >&2; ls -la "$L/skills/LifeOS" >&2; exit 1; }
-test -f "$L/skills/LifeOS/SKILL.md" || { echo "skills/LifeOS/SKILL.md does not resolve through the link" >&2; exit 1; }
-resolved="$(cd "$L/skills/LifeOS" && pwd -P)"
-want="$(cd "$L/LifeOS" && pwd -P)"        # repo-root payload dir, NOT a copy under skills/
-[ "$resolved" = "$want" ] || { echo "skills/LifeOS resolves to $resolved, want repo-root $want" >&2; exit 1; }
-diff -q "$L/skills/LifeOS/SKILL.md" "$L/LifeOS/SKILL.md" >/dev/null || { echo "skills/LifeOS/SKILL.md is not the live repo-root SKILL.md" >&2; exit 1; }
-echo "skills/LifeOS loader symlink OK (-> $resolved)"
+if [ -e "$L/skills/LifeOS" ] || [ -L "$L/skills/LifeOS" ]; then
+  echo "skills/LifeOS must NOT be deployed (P1-1), but it exists:" >&2
+  ls -la "$L/skills/LifeOS" >&2
+  exit 1
+fi
+# The separate Interview skill IS deployed (onboarding unaffected).
+test -s "$L/skills/Interview/SKILL.md" || { echo "Interview skill not deployed" >&2; exit 1; }
+echo "skills/LifeOS not deployed OK (Interview present)"
 CASE
-run_case 12_skills_loader_symlink "$F"
+run_case 12_skills_not_deployed "$F"
 
 # ── 13. package.json is deploy-managed (P2-a) ───────────────────────────────
 # package.json must be hash-enrolled in the deploy state (not copy-if-missing),
@@ -693,6 +705,45 @@ grep -qF '{{test_suite.name}}' "$tc" || { echo "FAIL: Handlebars {{test_suite.na
 echo "Handlebars rewrite OK ($n .hbs; 0 ~/.claude; {{…}} intact)"
 CASE
 run_case 15_hbs_rewrite "$F"
+
+# ── 16. PULSE service templates + code are localized (P1-2 / P1-3) ──────────
+# P1-2: .plist/.service are now in TEXT_EXT, so RH1/RH4 rewrite their
+# __HOME__/.claude paths to absolute config-root paths (<RT>/<CR>) while leaving a
+# bare __HOME__ — used for a NON-.claude path — intact for Pulse's own
+# `sed s|__HOME__|$HOME|` / `.replaceAll("__HOME__", HOME)` pass. P1-3: HOMETOK now
+# also consumes `?? "…"` fallbacks, so `process.env.HOME ?? "~"` immediately before
+# a .claude path localizes too. Without these, generated launchd/systemd units and
+# the 15+ nullish-HOME PULSE .ts files escape to the real ~/.claude.
+F="$CMD_DIR/16_pulse_localized.sh"
+write_case 16_pulse_localized >/dev/null <<'CASE'
+set -euo pipefail
+source "$LP_RUN/env.sh"
+pulse="$RT/PULSE"
+test -d "$pulse" || { echo "deployed PULSE dir missing: $pulse" >&2; exit 1; }
+# (a) 0 __HOME__/.claude and 0 ~/.claude / $HOME/.claude in deployed .plist/.service.
+bad="$(grep -rnE '__HOME__/\.claude|~/\.claude|\$HOME/\.claude|\$\{HOME\}/\.claude' "$pulse" --include='*.plist' --include='*.service' 2>/dev/null || true)"
+if [ -n "$bad" ]; then echo "FAIL: home-form .claude paths survive in deployed PULSE .plist/.service:" >&2; printf '%s\n' "$bad" >&2; exit 1; fi
+# (b) they carry the absolute config-root runtime path <RT> instead.
+grep -qF "$RT/PULSE" "$pulse/com.lifeos.pulse.plist"   || { echo "FAIL: pulse.plist not localized to <RT>" >&2; exit 1; }
+grep -qF "$RT/PULSE" "$pulse/com.lifeos.pulse.service" || { echo "FAIL: pulse.service not localized to <RT>" >&2; exit 1; }
+# (c) a bare __HOME__ used for a NON-.claude path is PRESERVED for Pulse's own
+# substitution (Environment=HOME=__HOME__; __HOME__/.bun/bin).
+grep -qE '^Environment=HOME=__HOME__$' "$pulse/com.lifeos.pulse.service" || { echo "FAIL: bare __HOME__ (Environment=HOME) was not preserved" >&2; exit 1; }
+grep -qF '__HOME__/.bun/bin' "$pulse/com.lifeos.pulse.service" || { echo "FAIL: bare __HOME__/.bun/bin was not preserved" >&2; exit 1; }
+# (d) P1-3: 0 `process.env.HOME ?? "~", ".claude"` escapes survive in ANY deployed
+# PULSE .ts (the only .claude-adjacent nullish-HOME shape in the payload). The
+# env-assignment form `process.env.HOME ?? ""` is NOT a .claude path and stays.
+esc="$(grep -rnF 'process.env.HOME ?? "~", ".claude"' "$pulse" --include='*.ts' 2>/dev/null || true)"
+if [ -n "$esc" ]; then echo "FAIL: nullish-HOME .claude escapes survive in deployed PULSE .ts:" >&2; printf '%s\n' "$esc" >&2; exit 1; fi
+# spot-check the three named files carry NO ~/.claude / $HOME/.claude and DO carry
+# the localized config-root runtime path.
+for f in run-job.ts lib.ts VoiceServer/voice.ts; do
+  if grep -qE '(~|\$HOME|\$\{HOME\})/\.claude' "$pulse/$f"; then echo "FAIL: $f still carries a ~/.claude path" >&2; grep -nE '(~|\$HOME|\$\{HOME\})/\.claude' "$pulse/$f" >&2; exit 1; fi
+  grep -qF "$RT" "$pulse/$f" || { echo "FAIL: $f not localized to <RT> (no config-root runtime path)" >&2; exit 1; }
+done
+echo "PULSE localization OK (.plist/.service on <RT>; bare __HOME__ preserved; 0 nullish-HOME .claude escapes)"
+CASE
+run_case 16_pulse_localized "$F"
 
 # ════════════════════════════════════════════════════════════════════════════
 echo

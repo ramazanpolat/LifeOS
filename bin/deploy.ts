@@ -41,7 +41,6 @@ import {
   renameSync,
   rmSync,
   statSync,
-  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { createHash } from "node:crypto";
@@ -134,7 +133,8 @@ function expandLeadingHome(value: string, home: string): string {
 //          ${process.env.HOME}, ~).
 // HOMETOK: home token in a JS constructor context (homedir(), os.homedir(),
 //          process.env.HOME[!], or any UPPER_SNAKE identifier ending in HOME —
-//          e.g. HOME, DEFAULT_HOME — optionally with a `|| '...'` fallback).
+//          e.g. HOME, DEFAULT_HOME — optionally with a `|| '...'` or `?? '...'`
+//          fallback).
 // Boundaries anchor `.claude`/`LIFEOS` to a real segment end (/, quote, ws,
 // backtick, EOL) — never `-`, so `.claude-playbooks` and already-rewritten
 // absolute roots never match (idempotency + no corruption of unrelated paths).
@@ -142,11 +142,16 @@ const STRHOME = "(?:\\$\\{HOME\\}|\\$HOME|\\$\\{process\\.env\\.HOME!?\\}|~)";
 // HOMETOK matches a home value in a JS expression: homedir()/os.homedir(),
 // process.env.HOME[!], or a bare identifier that IS the home dir — lowercase
 // `home` or any UPPER_SNAKE name ending in HOME (HOME, DEFAULT_HOME) — each
-// optionally with a `|| '...'` fallback. Bounded so `chrome`, `.home`,
-// `atHOME`, `process.env.HOME` (as bare id) never mis-match.
+// optionally with a `|| '...'` OR `?? '...'` fallback (P1-3: nullish-coalescing
+// fallbacks like `process.env.HOME ?? "~"` are as common as `||` and must be
+// consumed too, else the token escapes the rewrite → real ~/.claude). The
+// fallback group only ever matches a `||`/`??` directly followed by a quoted
+// literal, so an unrelated `??` (e.g. `Bun.which("claude") ?? join(…)`) is never
+// swallowed. Bounded so `chrome`, `.home`, `atHOME`, `process.env.HOME` (as bare
+// id) never mis-match.
 const HOMETOK =
   "(?:(?:os\\.)?homedir\\(\\)|process\\.env\\.HOME!?|(?<![.\\w$])(?:home|[A-Z_]*HOME)(?![.\\w]))" +
-  "(?:\\s*\\|\\|\\s*['\"][^'\"]*['\"])?";
+  "(?:\\s*(?:\\|\\||\\?\\?)\\s*['\"][^'\"]*['\"])?";
 // Segment boundary: `.claude`/`LIFEOS` must NOT be followed by `-` (so
 // `.claude-playbooks` and any already-rewritten absolute root never match →
 // idempotency), `.` (so a sibling `.claude.json` is left intact), or a word
@@ -176,6 +181,20 @@ const RULES: Rule[] = [
   { name: "R2d", re: new RegExp(HOMETOK + "\\s*\\+\\s*(['\"])/\\.claude" + BOUND, "g"), rep: (_m, q) => q + CR },
   // R4 — string/shell form, non-LIFEOS .claude → <CR>
   { name: "R4", re: new RegExp(STRHOME + "/\\.claude" + BOUND, "g"), rep: () => CR },
+  // RH1 / RH4 — the `__HOME__` literal token (P1-2). PULSE/TOOLS service
+  //        templates (.plist/.service) hard-code `__HOME__/.claude/…` and are
+  //        materialized at runtime by a `sed s|__HOME__|$HOME|` / `.replaceAll(
+  //        "__HOME__", HOME)` pass — so without a deploy-time rewrite the
+  //        generated launchd/systemd unit targets the REAL ~/.claude, not this
+  //        checkout. `__HOME__` is NOT a STRHOME/HOMETOK form, so R1–R4 never
+  //        touched it. These two mirror R1/R4 but on the literal token, and fire
+  //        ONLY when `__HOME__` is immediately followed by `/.claude`: a bare
+  //        `__HOME__` (Environment=HOME=__HOME__, `__HOME__/.bun/bin`, `__HOME__/
+  //        Applications/…`) MUST keep the token for Pulse's own substitution.
+  //        Longest-first: RH1 (…/.claude/LIFEOS → <RT>) before RH4 (…/.claude →
+  //        <CR>). Idempotent — the rewritten absolute paths contain no `__HOME__`.
+  { name: "RH1", re: new RegExp("__HOME__/\\.claude/LIFEOS" + BOUND, "g"), rep: () => RT },
+  { name: "RH4", re: new RegExp("__HOME__/\\.claude" + BOUND, "g"), rep: () => CR },
   // Rrel — relative-import fixup. Upstream ships `../../../.claude/hooks/...`
   //        assuming the runtime sits directly under the config root (~/.claude/
   //        LIFEOS/...). In this layout the runtime is one level deeper
@@ -287,7 +306,21 @@ function rewriteText(content: string): { text: string; count: number } {
 // tokens (~/.claude, $HOME/.claude, LIFEOS/, ../ import chains) and never `{{…}}`,
 // so Handlebars syntax is left intact. (Skills carry no deploy-time tokens, so
 // .hbs are added to pathRewriteFiles only, never tokenFiles — step 9 skips them.)
-const TEXT_EXT = new Set([".ts", ".js", ".sh", ".json", ".md", ".yaml", ".yml", ".toml", ".txt", ".hbs"]);
+//
+// `.plist` and `.service` are included so the PULSE launchd/systemd service
+// templates (P1-2) get the step-8 rewrite of their `__HOME__/.claude/…` paths to
+// absolute checkout paths (RH1/RH4). They are materialized at runtime by a
+// `sed s|__HOME__|$HOME|` / `.replaceAll("__HOME__", HOME)` pass, so localizing
+// the `.claude` paths at DEPLOY time (while leaving the bare `__HOME__` for that
+// runtime pass) is what keeps the generated unit pointed at this checkout, not
+// the real ~/.claude. Only the three PULSE `.plist` + one `.service` payload
+// files carry `__HOME__`; they hold no `{{…}}` deploy tokens, so step-9 token
+// substitution is a no-op on them. `.template` is deliberately NOT added: the ten
+// TOOLS `*.plist.template` files (last-segment ext `.template`) carry their OWN
+// `{{…}}`/`$HOME`/`~` template forms meant for a separate real-~/.claude
+// installer, and are out of P1-2's PULSE scope — adding `.template` would
+// prematurely rewrite/substitute them.
+const TEXT_EXT = new Set([".ts", ".js", ".sh", ".json", ".md", ".yaml", ".yml", ".toml", ".txt", ".hbs", ".plist", ".service"]);
 const WALK_SKIP = new Set(["node_modules", ".git", ".DS_Store"]);
 
 function* walkFiles(dir: string, skip: Set<string> = WALK_SKIP): Generator<string> {
@@ -639,7 +672,6 @@ function preflight(): void {
   requireFile(join(PAYLOAD, "package.json"), "install/package.json");
   requireFile(join(PAYLOAD, "LIFEOS", "VERSION"), "install/LIFEOS/VERSION");
   if (FULL) requireFile(join(PAYLOAD, "settings.enhancements.json"), "install/settings.enhancements.json");
-  if (existsSync(join(CR, "LifeOS", "SKILL.md")) === false) die(`missing LifeOS/SKILL.md — cannot create the skills/LifeOS loader symlink.`);
 }
 
 // ── settings.json build ───────────────────────────────────────────────
@@ -752,12 +784,17 @@ function planDryRun(version: string): void {
   log("PLAN (dry-run — nothing is written):");
   log("");
 
-  // 1 skills + LifeOS symlink
-  const nSkills = countMissing(join(PAYLOAD, "skills"), join(CR, "skills"));
-  log(`  1. skills         sync managed install/skills → skills/           (would copy ${nSkills} missing file(s))`);
+  // 1 skills (the stock LifeOS installer skill is NOT deployed — P1-1)
+  let nSkills = 0;
+  for (const e of readdirSync(join(PAYLOAD, "skills"), { withFileTypes: true })) {
+    if (e.name === "LifeOS") continue;
+    if (e.isDirectory()) nSkills += countMissing(join(PAYLOAD, "skills", e.name), join(CR, "skills", e.name));
+    else if (e.isFile() && !existsSync(join(CR, "skills", e.name))) nSkills++;
+  }
+  log(`  1. skills         sync managed install/skills (−LifeOS) → skills/  (would copy ${nSkills} missing file(s))`);
   const skillLink = join(CR, "skills", "LifeOS");
-  log(`     skills/LifeOS  symlink → ../LifeOS                             (${existsSync(skillLink) ? "exists — skip" : "would create"})`);
-  row("1 skills", nSkills, "", "", "loader symlink skills/LifeOS");
+  log(`     skills/LifeOS  stock installer skill NOT deployed              (${existsSync(skillLink) ? "present — remove if deployer-owned, else leave" : "absent"})`);
+  row("1 skills", nSkills, "", "", "skills/LifeOS not deployed");
 
   // 2 runtime
   let nRuntime = 0;
@@ -856,14 +893,16 @@ function applyDeploy(version: string, bunBin: string, bunDir: string): void {
   const tokenFiles: string[] = [];
   const managedWritten: string[] = [];
 
-  // 1. skills + loader symlink
+  // 1. skills — sync all EXCEPT "LifeOS"; clean up any deployer-owned leftover
   {
-    // Sync every top-level skills/ entry EXCEPT "LifeOS". The LifeOS skill is a
-    // loader SYMLINK (skills/LifeOS → ../LifeOS, i.e. the live repo-root LifeOS/
-    // SKILL.md), created below. Copying install/skills/LifeOS/ here would both
-    // win the lstat race so the symlink branch never runs AND deploy a stale
-    // committed snapshot instead of the live skill — so it is excluded from the
-    // sync, letting the symlink be the sole skills/LifeOS.
+    // The stock LifeOS installer skill (skills/LifeOS) is intentionally NOT
+    // deployed (P1-1). bin/deploy.ts IS the installer; the stock skill exposes
+    // `/lifeos-setup`, whose Setup workflow runs DeployCore/ScaffoldUser against
+    // <configRoot>/LIFEOS — the tracked LifeOS/ payload on case-insensitive
+    // macOS, a wrong unignored tree on Linux — corrupting the checkout. So it is
+    // both redundant and a footgun. (Interview is a SEPARATE skill, still
+    // deployed, so onboarding is unaffected.) Every other top-level skills/ entry
+    // syncs normally.
     let copied = 0, updated = 0, preserved = 0;
     const fails: string[] = [];
     for (const e of readdirSync(join(PAYLOAD, "skills"), { withFileTypes: true })) {
@@ -885,17 +924,30 @@ function applyDeploy(version: string, bunBin: string, bunDir: string): void {
       pathRewriteFiles.push(...r.written);
     }
     failOnCopyErrors("skills synchronization", fails);
-    let linkNote = "";
+
+    // Clean up a skills/LifeOS a PRIOR deploy left behind — the `../LifeOS`
+    // loader symlink (round-3's now-reversed decision), or an old-format copied
+    // dir. Remove it ONLY if it is DEPLOYER-OWNED; never touch user content. It
+    // is deployer-owned iff it is (a) the `../LifeOS` loader symlink, or (b) a
+    // directory EVERY descendant of which is a deploy-managed, hash-matching
+    // REGULAR file. Anything else — a user's custom skill, a managed dir carrying
+    // local edits, a dir hiding a symlink / fifo / socket / device node, or a
+    // stray regular file — is user content: leave it UNTOUCHED (do not delete, do
+    // not die), skip, and note it.
+    //
+    // skills/LifeOS is NEVER managed by this deployer going forward, so whenever
+    // it is present in ANY form we FIRST purge every enrolled skills/LifeOS/**
+    // key (delete from nextFiles + mark seen), in BOTH the remove and the
+    // leave-untouched branches. Marking them seen is load-bearing even when we
+    // leave the dir alone: removeStaleManagedFiles later deletes any enrolled,
+    // hash-matching, still-on-disk file that is NOT in `seen` (treating it as an
+    // upstream-removed managed file). Without this, the enrolled SKILL.md inside a
+    // dir we chose to preserve for its nested user symlink would be silently
+    // deleted — mutilating the very user content we set out to protect. Purging
+    // also stops any future deploy from walking a stale key THROUGH a since-
+    // changed path (assertSafeDestination abort).
+    let linkNote: string;
     const link = join(CR, "skills", "LifeOS");
-    // Purge any enrolled `skills/LifeOS` / `skills/LifeOS/**` keys from nextFiles
-    // and mark them seen. Run this whenever the final on-disk shape is (or has
-    // just become) the loader symlink — including the idempotent already-symlink
-    // case (P1-1): a prior run that migrated the copied dir and created the
-    // symlink, then crashed before saveDeployState, leaves those stale keys in
-    // previous.files. If they are not purged, the next run takes the no-op
-    // already-symlink branch and removeStaleManagedFiles later walks them THROUGH
-    // the now-symlink, tripping assertSafeDestination and aborting every future
-    // deploy. Marking them seen also stops stale-cleanup from following them.
     const purgeSkillsLifeosKeys = (): void => {
       for (const k of Object.keys(previous.files)) {
         if (k === "skills/LifeOS" || k.startsWith("skills/LifeOS/")) {
@@ -909,71 +961,48 @@ function applyDeploy(version: string, bunBin: string, bunDir: string): void {
     try {
       linkStat = lstatSync(link);
     } catch {}
-    const isLoaderSymlink =
-      linkStat !== null && linkStat.isSymbolicLink() &&
-      (() => { try { return readlinkSync(link) === "../LifeOS"; } catch { return false; } })();
-    if (isLoaderSymlink) {
-      // Already the correct loader symlink — idempotent no-op, but still purge any
-      // stale skills/LifeOS/** state (see purgeSkillsLifeosKeys) so a migrate-
-      // then-crash from a prior run cannot strand this deploy or any future one.
-      purgeSkillsLifeosKeys();
-      linkNote = "skills/LifeOS symlink OK";
-    } else if (linkStat !== null) {
-      // Present but NOT the loader symlink. The old deployer COPIED
-      // install/skills/LifeOS/ as a real directory and enrolled its files in
-      // state; stale-cleanup removes managed FILES but never their DIRS, so the
-      // now-empty dir would permanently block the `../LifeOS` symlink and disable
-      // the loader. Migrate it to the symlink — but PRESERVATION FIRST: only
-      // auto-delete a directory EVERY descendant of which is a deploy-managed,
-      // hash-matching REGULAR file (a pristine old-format copy). A user's custom
-      // skills/LifeOS, a managed dir carrying local edits, or a dir hiding a
-      // symlink / fifo / socket / device node must never be silently deleted —
-      // stop with an actionable error instead.
-      const wasSymlink = linkStat.isSymbolicLink();
-      const wasDir = linkStat.isDirectory() && !wasSymlink;
-      if (wasDir) {
-        // Inspect EVERY entry recursively via readdirSync(withFileTypes) — NOT
-        // walkFiles(), which silently skips symlinks (and thus would render a
-        // user-planted symlink/fifo invisible and let the rmSync below delete it).
-        // Returns the first offending path (relative key), or null if the whole
-        // tree is managed+hash-matching regular files.
-        const firstUnmanagedEntry = (root: string): string | null => {
-          for (const entry of readdirSync(root, { withFileTypes: true })) {
-            const p = join(root, entry.name);
-            if (entry.isSymbolicLink()) return relativeKey(p);
-            if (entry.isDirectory()) {
-              const nested = firstUnmanagedEntry(p);
-              if (nested) return nested;
-              continue;
-            }
-            if (!entry.isFile()) return relativeKey(p); // fifo/socket/device/etc.
-            const k = relativeKey(p);
-            if (previous.files[k] === undefined || hashFile(p) !== previous.files[k]) return k;
-          }
-          return null;
-        };
-        const offender = firstUnmanagedEntry(link);
-        if (offender) {
-          die(`skills/LifeOS is a directory with an unmanaged, locally-modified, or ` +
-            `non-regular entry (${offender}) — refusing to delete it. Back it up and ` +
-            `remove it manually to enable the ../LifeOS loader symlink.`);
-        }
-      } else if (!wasSymlink) {
-        die(`skills/LifeOS is an unexpected regular file — remove it manually to ` +
-          `enable the ../LifeOS loader symlink.`);
-      }
-      // Safe: a fully-managed old-format dir, or a wrong-target symlink (never
-      // user data). Purge any enrolled skills/LifeOS/** keys, then create the
-      // loader symlink.
-      purgeSkillsLifeosKeys();
-      rmSync(link, { recursive: true, force: true });
-      mkdirSync(dirname(link), { recursive: true });
-      symlinkSync("../LifeOS", link); // relative → <CR>/LifeOS
-      linkNote = wasDir ? "skills/LifeOS migrated (copied dir → ../LifeOS symlink)" : "skills/LifeOS replaced → ../LifeOS symlink";
+    if (linkStat === null) {
+      linkNote = "skills/LifeOS absent — nothing to do";
     } else {
-      mkdirSync(dirname(link), { recursive: true });
-      symlinkSync("../LifeOS", link); // relative → <CR>/LifeOS
-      linkNote = "skills/LifeOS → ../LifeOS created";
+      // Present in some shape — de-enroll + protect from stale-cleanup up front
+      // (see the note above), then decide remove vs leave-untouched.
+      purgeSkillsLifeosKeys();
+      const isLoaderSymlink =
+        linkStat.isSymbolicLink() &&
+        (() => { try { return readlinkSync(link) === "../LifeOS"; } catch { return false; } })();
+      // A fully deploy-managed old-format directory: inspect EVERY entry
+      // recursively via readdirSync(withFileTypes) — NOT walkFiles(), which
+      // silently skips symlinks (and would render a user-planted symlink/fifo
+      // invisible, letting the rmSync below delete it). Returns the first
+      // offending path, or null if the whole tree is managed+hash-matching
+      // regular files.
+      const firstUnmanagedEntry = (root: string): string | null => {
+        for (const entry of readdirSync(root, { withFileTypes: true })) {
+          const p = join(root, entry.name);
+          if (entry.isSymbolicLink()) return relativeKey(p);
+          if (entry.isDirectory()) {
+            const nested = firstUnmanagedEntry(p);
+            if (nested) return nested;
+            continue;
+          }
+          if (!entry.isFile()) return relativeKey(p); // fifo/socket/device/etc.
+          const k = relativeKey(p);
+          if (previous.files[k] === undefined || hashFile(p) !== previous.files[k]) return k;
+        }
+        return null;
+      };
+      const isManagedDir =
+        !linkStat.isSymbolicLink() && linkStat.isDirectory() && firstUnmanagedEntry(link) === null;
+      if (isLoaderSymlink || isManagedDir) {
+        rmSync(link, { recursive: true, force: true });
+        linkNote = isLoaderSymlink
+          ? "skills/LifeOS deployer-owned loader symlink removed (no longer deployed)"
+          : "skills/LifeOS deployer-managed old-format dir removed (no longer deployed)";
+      } else {
+        // User content — leave it exactly as found (state keys already purged
+        // above, so stale-cleanup will not touch any enrolled file within it).
+        linkNote = "skills/LifeOS left untouched (unmanaged user content)";
+      }
     }
     log(`  1. skills         copied ${copied}, updated ${updated}, preserved ${preserved}; ${linkNote}`);
     row("1 skills", copied, preserved, updated, linkNote);
@@ -1231,16 +1260,18 @@ function patchPathsTs(): string {
 }
 
 /**
- * chmod +x the statusline script (always deployer-managed) plus every
- * *.hook.ts / *.hook.sh under hooks/ that THIS deploy actually wrote. A hook
- * whose key is NOT in `managedKeys` is a file the sync preserved (a user's
- * private custom hook, or any pre-existing file colliding with hooks/) and is
- * left with its original mode — never forced to 0755 (P2-4).
+ * chmod +x the statusline script plus every *.hook.ts / *.hook.sh under hooks/
+ * that THIS deploy actually wrote. A file whose key is NOT in `managedKeys` is
+ * one the sync PRESERVED (a user's private custom hook, a user-customized
+ * statusline, or any pre-existing file colliding with a managed path) and is
+ * left with its original mode — never forced to 0755 (P2-4). The statusline is
+ * gated the same way as the hooks: only chmod it when this deploy wrote it, so a
+ * preserved user copy keeps whatever mode the user set (e.g. planted 0644).
  */
 function chmodExecutables(managedKeys: Set<string>): number {
   let n = 0;
   const status = join(RT, "LIFEOS_StatusLine.sh");
-  if (existsSync(status)) {
+  if (existsSync(status) && managedKeys.has(relativeKey(status))) {
     chmodSync(status, 0o755);
     n++;
   }

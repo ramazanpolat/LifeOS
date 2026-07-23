@@ -92,6 +92,7 @@ credentials/
 /.credentials.json
 /backups/
 /teams/
+/tasks/
 /history.jsonl
 /projects/
 /todos/
