@@ -452,6 +452,7 @@ baseline="$(cat "$LP_E2E_RUN_ROOT/settings-baseline.hash")"
 # when the incoming commit ALSO changes .playbook (a version bump), which a plain
 # `git pull --ff-only` would otherwise refuse.
 pb_branch_before="$(grep '^branch = ' .playbook || true)"
+pb_repo_before="$(grep '^repository = ' .playbook || true)"
 if [ -n "$LP_TEST_REMOTE" ]; then
   publisher="$LP_E2E_RUN_ROOT/publisher"
   git clone --quiet "$LP_SOURCE" "$publisher"
@@ -465,9 +466,14 @@ if [ -n "$LP_TEST_REMOTE" ]; then
   # .playbook would be overwritten"). The update script must preserve the
   # injected [source] and still take the upstream version.
   sed 's/^version = .*/version = "9.9.9-e2e"/' "$publisher/.playbook" > "$publisher/.playbook.new"
+  # Also add an upstream [source] key: pre-fix reapply_source restored the saved
+  # local [source] WHOLESALE, so this would never reach the install. The
+  # partial-merge must let it land while keeping the injected branch/repository.
+  # [source] is the last section in the manifest, so append under it.
+  printf 'source_marker = "UPSTREAM_SOURCE_LANDS"\n' >> "$publisher/.playbook.new"
   mv "$publisher/.playbook.new" "$publisher/.playbook"
   git -C "$publisher" add LifeOS/install/commands/context-search.md LifeOS/install/commands/cs.md .playbook
-  git -C "$publisher" commit --quiet -m "test: publish managed payload update + version bump"
+  git -C "$publisher" commit --quiet -m "test: publish managed payload update + version + [source] change"
   git -C "$publisher" push --quiet origin "$LP_BRANCH"
   printf '\nLOCAL_CUSTOMIZATION_MARKER\n' >> commands/cs.md
 fi
@@ -490,6 +496,13 @@ if [ -n "$LP_TEST_REMOTE" ]; then
   test "$(grep -c '^\[source\]' .playbook)" = "1" || { echo "FAIL: [source] section duplicated/lost" >&2; cat .playbook >&2; exit 1; }
   if [ -n "$pb_branch_before" ]; then
     grep -qF "$pb_branch_before" .playbook || { echo "FAIL: injected [source] branch lost across update" >&2; cat .playbook >&2; exit 1; }
+  fi
+  # PARTIAL-MERGE: the upstream [source] addition reached the install (the old
+  # wholesale restore of the saved local block would have discarded it)…
+  grep -q 'source_marker = "UPSTREAM_SOURCE_LANDS"' .playbook || { echo "FAIL: upstream [source] change did not land (wholesale-restore regression)" >&2; cat .playbook >&2; exit 1; }
+  # …while the CLI-injected repository survived unchanged.
+  if [ -n "$pb_repo_before" ]; then
+    grep -qF "$pb_repo_before" .playbook || { echo "FAIL: injected [source] repository lost across update" >&2; cat .playbook >&2; exit 1; }
   fi
 fi
 # Existing managed settings remain stable when their payload did not change.
@@ -520,33 +533,119 @@ echo "OK 09_update_dirty_guard"
 CASE
 )"
 
-# 09b interrupted-deploy recovery (P2-b) --------------------------------------
-c09b="$(write_case 09b_interrupted_recovery <<'CASE'
+# 09b write-ahead-journal crash recovery (P1-2 / P1-3) ------------------------
+c09b="$(write_case 09b_journal_recovery <<'CASE'
 set -euo pipefail
 source "$LP_E2E_ENV"
 cd "$LP_INSTALL"
-# Simulate a crash mid-deploy: a managed file was copied RAW (before the step-8
-# path-rewrite), then the run died before saveDeployState — so the state json is
-# gone and the in-progress marker is left behind. A naive redeploy would see the
-# raw file with no recorded hash, treat it as pre-existing, and PRESERVE it,
-# stranding the hard-coded ~/.claude path. The marker must make the deployer
-# re-adopt (re-copy + re-rewrite) it.
-victim="hooks/PreToolGuard.hook.ts"
-test -f "$victim"
-printf '\nconst LEFTOVER_RAW = "~/.claude/LIFEOS/TOOLS/Stranded.ts";\n' >> "$victim"
-grep -q '~/.claude' "$victim"                 # raw path present pre-recovery
-rm -f .lifeos-deploy-state.json               # crash: state never persisted
-: > .lifeos-deploy-inprogress                 # crash: marker left behind
+# Crash recovery is driven by the WRITE-AHEAD JOURNAL, not the state hash: the
+# journal records the managed files THIS deployer wrote, and on resume (marker
+# present) a managed destination is re-processed IFF its key is in that journal.
+# Three co-resident scenarios exercised in ONE resume:
+#   (i)   first-deploy interruption — a file copied RAW (pre-rewrite), with NO
+#         state entry, IN the journal → re-processed (raw ~/.claude gone).
+#   (ii)  update interruption — a file with fresh bytes but a STALE state hash,
+#         IN the journal → re-enrolled (hash refreshed), NOT stranded from future
+#         upstream updates.
+#   (iii) a genuine USER file colliding with a managed path, NOT in the journal →
+#         preserved, never clobbered.
+VI="hooks/PreToolGuard.hook.ts"        # (i)
+VII="commands/context-search.md"       # (ii)
+VIII="hooks/LoadContext.hook.ts"       # (iii)
+for f in "$VI" "$VII" "$VIII"; do test -f "$f" || { echo "victim missing: $f" >&2; exit 1; }; done
+printf '\nconst LEFTOVER_RAW = "~/.claude/LIFEOS/TOOLS/Stranded.ts";\n' >> "$VI"  # (i) raw path
+grep -q '~/.claude' "$VI"
+printf 'MY PRIVATE USER EDIT — DO NOT CLOBBER\n' > "$VIII"                        # (iii) user content
+# Craft the crashed state + journal (marker present → resume).
+python3 - "$VI" "$VII" "$VIII" <<'PY'
+import json, sys
+vi, vii, viii = sys.argv[1:4]
+st = json.load(open('.lifeos-deploy-state.json'))
+st['files'].pop(vi, None)              # (i)   no state entry (first-deploy shape)
+st['files'][vii] = 'a' * 64            # (ii)  stale/bogus state hash
+st['files'].pop(viii, None)            # (iii) pre-existing collision, no state entry
+json.dump(st, open('.lifeos-deploy-state.json', 'w'), indent=2)
+json.dump({'version': 1, 'keys': [vi, vii]},              # journal: (i)+(ii), NOT (iii)
+          open('.lifeos-deploy-journal.json', 'w'), indent=2)
+PY
+: > .lifeos-deploy-inprogress          # crash marker
 out="$(bun bin/deploy.ts --apply 2>&1)"
 printf '%s\n' "$out"
 grep -qi 'resuming an interrupted deploy' <<<"$out"
 grep -q 'Deploy complete' <<<"$out"
-# Re-adopted (re-copied from payload + path-rewritten): the raw path is gone.
-if grep -q '~/.claude' "$victim"; then echo "FAIL: raw ~/.claude survived recovery in $victim" >&2; grep -n '~/.claude' "$victim" >&2; exit 1; fi
-# Marker cleared after a successful, state-persisted deploy; state rebuilt.
-test ! -e .lifeos-deploy-inprogress || { echo "FAIL: .lifeos-deploy-inprogress not removed after recovery" >&2; exit 1; }
+# (i) re-processed: raw ~/.claude gone.
+if grep -q '~/.claude' "$VI"; then echo "FAIL (i): raw ~/.claude survived in $VI" >&2; grep -n '~/.claude' "$VI" >&2; exit 1; fi
+# (ii) re-enrolled, not stranded: recorded hash matches on-disk and is not the stale one.
+python3 - "$VII" <<'PY'
+import json, sys, hashlib
+vii = sys.argv[1]
+rec = json.load(open('.lifeos-deploy-state.json'))['files'].get(vii)
+disk = hashlib.sha256(open(vii, 'rb').read()).hexdigest()
+if rec is None: print('FAIL (ii): %s not re-enrolled (stranded)' % vii); sys.exit(1)
+if rec == 'a'*64: print('FAIL (ii): %s still carries the stale hash (stranded)' % vii); sys.exit(1)
+if rec != disk: print('FAIL (ii): recorded %s != on-disk %s' % (rec, disk)); sys.exit(1)
+print('(ii) re-enrolled OK')
+PY
+# (iii) user file preserved (not clobbered) and NOT enrolled.
+grep -q 'MY PRIVATE USER EDIT' "$VIII" || { echo "FAIL (iii): user file $VIII was clobbered on resume" >&2; exit 1; }
+python3 - "$VIII" <<'PY'
+import json, sys
+viii = sys.argv[1]
+if viii in json.load(open('.lifeos-deploy-state.json'))['files']:
+    print('FAIL (iii): user file %s was enrolled' % viii); sys.exit(1)
+print('(iii) preserved + unenrolled OK')
+PY
+# Marker + journal removed after a successful, state-persisted deploy.
+test ! -e .lifeos-deploy-inprogress || { echo "FAIL: marker not removed" >&2; exit 1; }
+test ! -e .lifeos-deploy-journal.json || { echo "FAIL: journal not removed" >&2; exit 1; }
 test -f .lifeos-deploy-state.json
-echo "OK 09b_interrupted_recovery"
+echo "OK 09b_journal_recovery (i re-processed, ii re-enrolled, iii preserved)"
+CASE
+)"
+
+# 09c old-format skills/LifeOS dir → symlink migration (P2-4) ------------------
+c09c="$(write_case 09c_skills_migration <<'CASE'
+set -euo pipefail
+source "$LP_E2E_ENV"
+cd "$LP_INSTALL"
+# An install made by the OLD deployer has skills/LifeOS as a COPIED DIRECTORY
+# enrolled in state, not the ../LifeOS loader symlink. Its managed FILES get
+# stale-cleaned but the now-empty DIR would permanently block the symlink → the
+# loader stays disabled. Simulate that starting state and deploy: the symlink
+# step must migrate the copied dir → the loader symlink and purge its
+# skills/LifeOS/** state keys.
+link="skills/LifeOS"
+test -L "$link"                                   # currently the correct symlink
+rm "$link"
+mkdir -p "$link"
+printf 'STALE COPIED SNAPSHOT — must be replaced\n' > "$link/SKILL.md"
+printf 'x\n' > "$link/extra-old-file.ts"
+python3 - <<'PY'
+import json, hashlib
+st = json.load(open('.lifeos-deploy-state.json'))
+for rel in ('skills/LifeOS/SKILL.md', 'skills/LifeOS/extra-old-file.ts'):
+    st['files'][rel] = hashlib.sha256(open(rel, 'rb').read()).hexdigest()   # enroll, as the old deployer did
+json.dump(st, open('.lifeos-deploy-state.json', 'w'), indent=2)
+PY
+out="$(bun bin/deploy.ts --apply 2>&1)"
+printf '%s\n' "$out"
+grep -q 'Deploy complete' <<<"$out"
+grep -qi 'skills/LifeOS migrated' <<<"$out" || { echo "FAIL: no migration message emitted" >&2; exit 1; }
+# Now the loader symlink → the LIVE repo-root skill (not a stale copy).
+test -L "$link" || { echo "FAIL: skills/LifeOS is not a symlink after migration" >&2; ls -la "$link" >&2; exit 1; }
+test "$(readlink "$link")" = "../LifeOS" || { echo "FAIL: symlink target is $(readlink "$link"), want ../LifeOS" >&2; exit 1; }
+diff -q "$link/SKILL.md" LifeOS/SKILL.md >/dev/null || { echo "FAIL: skills/LifeOS/SKILL.md is not the live repo-root SKILL.md" >&2; exit 1; }
+if grep -q 'STALE COPIED SNAPSHOT' "$link/SKILL.md"; then echo "FAIL: stale snapshot survived migration" >&2; exit 1; fi
+# The copied-dir state keys were purged.
+python3 - <<'PY'
+import json, sys
+st = json.load(open('.lifeos-deploy-state.json'))
+leftover = [k for k in st['files'] if k == 'skills/LifeOS' or k.startswith('skills/LifeOS/')]
+if leftover: print('FAIL: skills/LifeOS/** keys not purged: %s' % leftover); sys.exit(1)
+print('state keys purged OK')
+PY
+test "$(git status --porcelain)" = " M .playbook" || { echo "FAIL: tree not clean-except-.playbook after migration:" >&2; git status --porcelain >&2; exit 1; }
+echo "OK 09c_skills_migration"
 CASE
 )"
 
@@ -577,7 +676,8 @@ run_case "$P_MAIN" 07_full_upgrade     "$c07"
 run_case "$P_AUX"  07b_full_fresh      "$c07b"
 run_case "$P_MAIN" 08_update_happy     "$c08"
 run_case "$P_MAIN" 09_update_dirty_guard "$c09"
-run_case "$P_MAIN" 09b_interrupted_recovery "$c09b"
+run_case "$P_MAIN" 09b_journal_recovery "$c09b"
+run_case "$P_MAIN" 09c_skills_migration "$c09c"
 run_case "$P_MAIN" 10_delete           "$c10"
 
 # ── report ─────────────────────────────────────────────────────────────

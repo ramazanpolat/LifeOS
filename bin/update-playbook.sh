@@ -24,45 +24,91 @@ if [ -n "$DIRTY" ]; then
   exit 1
 fi
 
-# Preserve the CLI-injected [source] metadata across the pull. The
-# claude-playbook CLI writes source fields (notably `branch = "..."`, plus the
-# install-time repository) into the tracked `.playbook` at install time, so
+# Preserve the CLI-injected [source] metadata across the pull — as a PARTIAL
+# MERGE, not a wholesale restore. The claude-playbook CLI writes source fields
+# (notably `branch = "..."`, plus an overriding `repository` when the user
+# installed from a fork) into the tracked `.playbook` at install time, so
 # `.playbook` always shows as locally modified. A plain `git pull --ff-only`
 # then REFUSES whenever the incoming commit ALSO touches `.playbook` — e.g. an
 # upstream version bump — with "Your local changes to .playbook would be
-# overwritten by merge". To stay update-safe:
-#   1. save the local [source] section (CLI-owned metadata, never payload),
+# overwritten by merge". To stay update-safe AND let upstream's own [source]
+# edits (a changed `update_script`, a new key) reach existing installs:
+#   1. diff the local [source] against the COMMITTED one (`git show HEAD:.playbook`)
+#      to identify ONLY the CLI-injected keys (present-and-new, or present-and-
+#      different), BEFORE any checkout,
 #   2. restore `.playbook` to its committed form so the fast-forward is clean,
-#   3. pull (now unobstructed — the upstream version bump lands),
-#   4. re-apply the saved [source] onto the freshly pulled manifest.
-# Pure POSIX sh + awk (no python).
+#   3. pull (now unobstructed — the upstream version bump + [source] edits land),
+#   4. merge just the CLI-injected keys back into the freshly pulled [source]
+#      (replace matching keys in place; append keys the pulled section lacks).
+# A blanket re-append of the saved local block (the previous approach) discarded
+# every upstream [source] change. Pure POSIX sh + awk (no python).
 
-# Capture the local [source] block: from the `[source]` header to the next
-# section header (or EOF).
-SRC_BLOCK=""
-if [ -f .playbook ] && grep -q '^\[source\]' .playbook; then
-  SRC_BLOCK=$(awk '
-    /^\[source\]/ { f=1 }
-    f==1 && /^\[/ && $0 !~ /^\[source\]/ { f=0 }
-    f==1 { print }
-  ' .playbook)
+INJECT_TMP="$(mktemp "${TMPDIR:-/tmp}/lifeos-src-inject.XXXXXX")"
+trap 'rm -f "$INJECT_TMP" "$INJECT_TMP.committed" "$INJECT_TMP.local"' EXIT INT TERM
+
+# _source_body — emit only the `key = value` body lines of the [source] section
+# read on stdin (the `[source]` header, blank lines, and other sections dropped).
+_source_body() {
+  awk '
+    /^\[source\]/ { f=1; next }
+    f==1 && /^\[/  { f=0 }
+    f==1 && /=/    { print }
+  '
+}
+
+# Compute the CLI-injected lines: local [source] entries whose key is ABSENT from
+# the committed [source], or PRESENT there with a different value. If `.playbook`
+# has no [source], or none was injected, INJECT_TMP is empty and reapply is a
+# no-op (a plain, non-CLI install is left exactly as pulled).
+if [ -f .playbook ]; then
+  git show HEAD:.playbook 2>/dev/null | _source_body > "$INJECT_TMP.committed" || true
+  _source_body < .playbook > "$INJECT_TMP.local"
+  awk '
+    function keyof(s,   k) { k=s; sub(/[[:space:]]*=.*/, "", k); gsub(/^[[:space:]]+|[[:space:]]+$/, "", k); return k }
+    NR==FNR { k=keyof($0); if (k != "") { cval[k]=$0; seen[k]=1 } next }
+    { k=keyof($0); if (k == "") next; if (!(k in seen) || cval[k] != $0) print }
+  ' "$INJECT_TMP.committed" "$INJECT_TMP.local" > "$INJECT_TMP"
+  rm -f "$INJECT_TMP.committed" "$INJECT_TMP.local"
 fi
 
-# reapply_source FILE — strip any existing [source] section from FILE, then
-# re-append the saved SRC_BLOCK (keeps upstream's version + our injected source).
-# A no-op when nothing was injected. Trailing blank lines are trimmed first so
-# repeated updates never accumulate blank lines.
+# reapply_source FILE — merge the CLI-injected key=value lines (INJECT_TMP) into
+# FILE's [source] section: replace matching keys in place, append injected keys
+# the section lacks, and create a [source] section if FILE has none. A no-op when
+# nothing was injected.
 reapply_source() {
   _pb="$1"
-  [ -n "$SRC_BLOCK" ] || return 0
-  awk '
-    /^\[source\]/ { skip=1 }
-    skip==1 && /^\[/ && $0 !~ /^\[source\]/ { skip=0 }
-    skip!=1 { print }
+  [ -s "$INJECT_TMP" ] || return 0
+  awk -v inj="$INJECT_TMP" '
+    function keyof(s,   k) { k=s; sub(/[[:space:]]*=.*/, "", k); gsub(/^[[:space:]]+|[[:space:]]+$/, "", k); return k }
+    BEGIN {
+      n = 0
+      while ((getline line < inj) > 0) {
+        k = keyof(line)
+        if (k != "" && !(k in val)) { val[k] = line; order[n++] = k }
+      }
+      close(inj)
+    }
+    /^\[source\]/ { insrc = 1; hadsrc = 1; print; next }
+    insrc == 1 && /^\[/ {
+      for (i = 0; i < n; i++) { k = order[i]; if (!(k in done)) print val[k] }
+      insrc = 0; print; next
+    }
+    insrc == 1 {
+      k = keyof($0)
+      if (k != "" && (k in val)) { print val[k]; done[k] = 1; next }
+      print; next
+    }
+    { print }
+    END {
+      if (insrc == 1) {
+        for (i = 0; i < n; i++) { k = order[i]; if (!(k in done)) print val[k] }
+      } else if (hadsrc != 1) {
+        print ""; print "[source]"
+        for (i = 0; i < n; i++) print val[order[i]]
+      }
+    }
   ' "$_pb" > "$_pb.tmp"
-  awk '{ lines[n++]=$0 } END { last=n; while (last>0 && lines[last-1]=="") last--; for (i=0;i<last;i++) print lines[i] }' "$_pb.tmp" > "$_pb.tmp2"
-  { cat "$_pb.tmp2"; printf '\n'; printf '%s\n' "$SRC_BLOCK"; } > "$_pb"
-  rm -f "$_pb.tmp" "$_pb.tmp2"
+  mv "$_pb.tmp" "$_pb"
 }
 
 # Clean `.playbook` so the fast-forward has no local modification to trip over.
@@ -75,9 +121,10 @@ if ! git pull --ff-only; then
   exit 1
 fi
 
-# Re-apply the CLI-injected [source] onto the pulled manifest (upstream version +
-# our branch/source). If the manifest shape is unexpected the awk strip is a
-# no-op and this degrades to a plain append of the saved block.
+# Merge the CLI-injected [source] keys onto the freshly pulled manifest: upstream's
+# own [source] edits are kept, only the CLI-owned keys (branch, overriding
+# repository) are re-injected. If the pulled manifest has no [source], one is
+# created from the injected keys; if nothing was injected, this is a no-op.
 reapply_source .playbook
 
 # Case-insensitive filesystems (macOS/Windows): pulling a commit that removes a

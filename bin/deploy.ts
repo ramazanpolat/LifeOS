@@ -35,6 +35,7 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  readlinkSync,
   realpathSync,
   renameSync,
   rmSync,
@@ -59,12 +60,28 @@ const PAYLOAD = join(CR, "LifeOS", "install");
 const REAL_HOME = homedir();
 const STATE_PATH = join(CR, ".lifeos-deploy-state.json");
 // Crash-recovery breadcrumb: written at the start of an --apply and removed only
-// after saveDeployState succeeds. Its presence at the start of a later --apply
-// means a previous run died mid-deploy (e.g. `bun install` failed) before its
-// state was persisted, so managed destinations may be sitting on disk raw
-// (pre-path-rewrite) with no recorded hash. See the `adopt` path in
-// syncManagedTree for how a resumed run re-processes them.
+// after saveDeployState succeeds (together with the journal). Its presence at the
+// start of a later --apply means a previous run died mid-deploy (e.g. `bun
+// install` failed) before its state was persisted, so managed destinations may be
+// sitting on disk raw (pre-path-rewrite) or half-updated, with the recorded state
+// hash stale or absent. On such a resume the WRITE-AHEAD JOURNAL (below) — not the
+// state hash — decides which managed files this deployer owns and may re-process.
 const INPROGRESS_PATH = join(CR, ".lifeos-deploy-inprogress");
+// Write-ahead journal: the set of managed keys the CURRENT --apply has actually
+// written, persisted after each file-writing step (steps 1,2,4,5 sync; step 8
+// rewrite; step 9 tokens) so an interruption at any step boundary leaves an
+// accurate record. It is the crash-recovery authority: on a resume (marker
+// present at startup) the PRIOR run's journal is loaded, and a managed
+// destination is re-processed — overwritten from source, re-enrolled, and
+// re-queued for the step-8 rewrite — IFF its key is in that journal, regardless
+// of whether the state hash exists or matches. This (a) re-enrolls a file the
+// crash left with new transformed bytes but a stale state hash (which plain
+// preserve semantics would strand from all future upstream updates), and (b)
+// never clobbers a genuine user file that merely collided with a managed path
+// (absent from the journal → preserved). Removed with the marker after
+// saveDeployState succeeds; a resume with no journal (or an unreadable one)
+// re-processes nothing, which is the safe default. Per-install state, gitignored.
+const JOURNAL_PATH = join(CR, ".lifeos-deploy-journal.json");
 
 // ── args ──────────────────────────────────────────────────────────────
 const argv = process.argv.slice(2);
@@ -189,7 +206,35 @@ const RULES: Rule[] = [
   //        strings start `runtime/`, so the quote is no longer followed by
   //        `LIFEOS/`. `@LIFEOS/...` imports (`@` between quote and LIFEOS) and
   //        `LIFEOS_*` identifiers (no `/`) never match.
-  { name: "R6a", re: /(['"`])LIFEOS\//g, rep: (_m, q) => q + "runtime/LIFEOS/" },
+  //
+  //        SEMANTIC-COMPARISON EXEMPTION (leading negative lookbehind): a
+  //        `"LIFEOS/..."` literal that is the ARGUMENT of a string-matching
+  //        method is NOT a path to localize — it is a value compared against
+  //        some OTHER string, and rewriting it silently changes the comparison.
+  //        The motivating case is PULSE/Tools/ReleaseAudit.ts, whose
+  //        `rel.startsWith("LIFEOS/MEMORY/PULSE_DATA/")` / `startsWith(
+  //        "LIFEOS/USER/")` test an EXTERNAL staged release (rel = relative(
+  //        STAGING, file), genuinely rooted at `LIFEOS/`); rewriting them to
+  //        `runtime/LIFEOS/...` breaks the release privacy audit. Same for
+  //        ContextAudit's `value.startsWith("LIFEOS/")` (value carries the
+  //        original ref form; CLAUDE_DIR is import.meta-relative to <CR>/runtime)
+  //        and the `.includes('LIFEOS/USER/')` privacy substrings in
+  //        change-detection / IntegrityMaintenance (a substring of
+  //        `runtime/LIFEOS/USER/` too, so exempting only widens the match). The
+  //        lookbehind exempts a leading `.<method>(` (optional whitespace after
+  //        the paren): startsWith/endsWith/includes/indexOf/lastIndexOf/match/
+  //        search/split/replace/replaceAll. Variable-length lookbehind is
+  //        supported by Bun (JavaScriptCore), as R6b's lookbehind already relies
+  //        on.
+  //        NOTE — comparison operators (=== !== == !=) are deliberately NOT
+  //        exempted: the payload's only such site, ReferenceCheck.ts:130
+  //        `relPath === 'LIFEOS/ALGORITHM/changelog.md'`, compares against
+  //        rel = relative(CLAUDE_DIR=<CR>, file), which in this layout is
+  //        `runtime/LIFEOS/...`; that literal MUST be rewritten to keep matching
+  //        (exempting it would strand the changelog exclusion). Path-construction
+  //        sites — `join(CLAUDE, "LIFEOS/TOOLS")` etc. — are preceded by `, `/
+  //        `(`, never a string-method call, so they still localize.
+  { name: "R6a", re: /(?<!\.(?:startsWith|endsWith|includes|indexOf|lastIndexOf|match|search|split|replace|replaceAll)\(\s*)(['"`])LIFEOS\//g, rep: (_m, q) => q + "runtime/LIFEOS/" },
   // R6b — the separate-arg spelling of R6a: `join(PAI, 'LIFEOS', 'MEMORY',
   //        ...)`. Anchored to a join/resolve/pathResolve call earlier on the
   //        same line (variable-length lookbehind, supported by Bun's V8) so a
@@ -215,7 +260,13 @@ function rewriteText(content: string): { text: string; count: number } {
 }
 
 // ── generic fs helpers ────────────────────────────────────────────────
-const TEXT_EXT = new Set([".ts", ".js", ".sh", ".json", ".md", ".yaml", ".yml", ".toml", ".txt"]);
+// `.hbs` is included so Handlebars templates (skills/Prompting/Templates/**) get
+// the step-8 path-rewrite: their rendered `bun run ~/.claude/Skills/...` commands
+// would otherwise hit the real ~/.claude. The rewrite rules only match path
+// tokens (~/.claude, $HOME/.claude, LIFEOS/, ../ import chains) and never `{{…}}`,
+// so Handlebars syntax is left intact. (Skills carry no deploy-time tokens, so
+// .hbs are added to pathRewriteFiles only, never tokenFiles — step 9 skips them.)
+const TEXT_EXT = new Set([".ts", ".js", ".sh", ".json", ".md", ".yaml", ".yml", ".toml", ".txt", ".hbs"]);
 const WALK_SKIP = new Set(["node_modules", ".git", ".DS_Store"]);
 
 function* walkFiles(dir: string, skip: Set<string> = WALK_SKIP): Generator<string> {
@@ -308,16 +359,19 @@ function loadDeployState(): DeployState {
  * only when its current hash still matches the deploy state; locally edited or
  * pre-existing files are preserved.
  *
- * `adopt` (crash recovery ONLY): when true, a managed destination that exists
- * but has no recorded prior hash is OVERWRITTEN from source and enrolled
- * (written) instead of being preserved. This is scoped to resuming an
- * interrupted deploy (the .lifeos-deploy-inprogress marker was present at
- * startup): managed trees are deploy-owned, so an un-enrolled file inside one
- * can only be debris a crashed run left behind — most dangerously a file copied
- * raw before the step-8 path-rewrite, which normal preserve semantics would
- * strand with hard-coded ~/.claude paths. Re-adopting it lets the rewrite/token
- * passes re-process it. Normal (non-resume) runs pass adopt=false and behave
- * byte-identically to before.
+ * `journalKeys` (crash recovery ONLY): the managed keys the interrupted prior
+ * run recorded in its write-ahead journal (empty on a normal, non-resume run).
+ * When a managed destination is NOT eligible for the ordinary refresh (its hash
+ * no longer matches the state hash, or no state hash exists), but its key IS in
+ * this set, it is OVERWRITTEN from source and enrolled (written) rather than
+ * preserved. That covers both crash shapes the state hash alone gets wrong:
+ *   - a first-deploy file copied raw before the step-8 rewrite (no state hash),
+ *   - an update whose new transformed bytes were written but whose state hash
+ *     was never refreshed (hash != priorHash WITH priorHash present) — which
+ *     plain preserve semantics would strand from every future upstream update.
+ * A managed destination that is NOT in the journal is treated as a genuine
+ * user file that collided with a managed path and is preserved untouched. A
+ * normal run passes an empty set and behaves byte-identically to before.
  */
 function syncManagedTree(
   src: string,
@@ -325,7 +379,7 @@ function syncManagedTree(
   previous: DeployState,
   nextFiles: Record<string, string>,
   seen: Set<string>,
-  adopt = false,
+  journalKeys: Set<string> = new Set(),
 ): SyncResult {
   const result: SyncResult = { copied: 0, updated: 0, preserved: 0, failures: [], written: [] };
   const engineSkip = new Set(["node_modules", ".git", "MEMORY"]);
@@ -363,10 +417,11 @@ function syncManagedTree(
         return;
       }
 
-      // Crash-recovery: re-adopt an un-enrolled managed file left by a crashed
-      // run (see the `adopt` note above). Only for regular files; symlinks/dirs
-      // are never adopted.
-      if (adopt && destinationStat.isFile() && !priorHash) {
+      // Crash-recovery: re-process a managed file the interrupted prior run
+      // recorded in its journal (see the `journalKeys` note above), regardless of
+      // whether the state hash is absent OR present-but-stale. Only regular
+      // files; symlinks/dirs are never re-processed this way.
+      if (journalKeys.has(key) && destinationStat.isFile()) {
         cpSync(s, d);
         result.copied++;
         result.written.push(d);
@@ -412,6 +467,43 @@ function saveDeployState(files: Record<string, string>): void {
   const state: DeployState = { version: 1, full: FULL, files };
   writeFileSync(tmp, JSON.stringify(state, null, 2) + "\n");
   renameSync(tmp, STATE_PATH);
+}
+
+interface DeployJournal {
+  version: 1;
+  keys: string[];
+}
+
+/**
+ * Load the PRIOR run's write-ahead journal (crash recovery). Returns the set of
+ * managed keys that run recorded as written. Any problem — missing file, bad
+ * shape, an unsafe/non-managed key — yields an EMPTY set: with no trustworthy
+ * evidence of ownership the resume re-processes nothing and preserves everything
+ * on disk (never clobbers a user file). Only ever consulted when the in-progress
+ * marker is present at startup.
+ */
+function loadJournal(): Set<string> {
+  if (!existsSync(JOURNAL_PATH)) return new Set();
+  try {
+    const parsed = JSON.parse(readFileSync(JOURNAL_PATH, "utf8")) as Partial<DeployJournal>;
+    if (parsed.version !== 1 || !Array.isArray(parsed.keys)) return new Set();
+    const keys = new Set<string>();
+    for (const key of parsed.keys) {
+      if (typeof key === "string" && isManagedKey(key)) keys.add(key);
+    }
+    return keys;
+  } catch {
+    return new Set();
+  }
+}
+
+/** Persist THIS run's journal atomically. Called at every file-writing step
+ * boundary so a crash leaves an accurate record of what was already written. */
+function saveJournal(keys: Set<string>): void {
+  const tmp = JOURNAL_PATH + ".tmp";
+  const journal: DeployJournal = { version: 1, keys: [...keys].sort() };
+  writeFileSync(tmp, JSON.stringify(journal, null, 2) + "\n");
+  renameSync(tmp, JOURNAL_PATH);
 }
 
 function failOnCopyErrors(label: string, failures: string[]): void {
@@ -730,15 +822,25 @@ function applyDeploy(version: string, bunBin: string, bunDir: string): void {
   log("");
   const previous = loadDeployState();
   // A marker already on disk means a prior --apply died before persisting state.
-  // Detect it BEFORE writing our own marker, then re-adopt any raw files it left.
+  // Detect it BEFORE writing our own marker, then load that run's write-ahead
+  // journal — the authority on which managed files it wrote and this run may
+  // re-process. A resume with no journal (crash before any step persisted, or an
+  // old marker-only install) re-processes nothing: the safe default.
   const resuming = existsSync(INPROGRESS_PATH);
+  const priorJournal = resuming ? loadJournal() : new Set<string>();
   writeFileSync(INPROGRESS_PATH, new Date().toISOString() + "\n");
-  if (resuming) log("  (resuming an interrupted deploy — re-adopting un-enrolled managed files)");
+  if (resuming) log(`  (resuming an interrupted deploy — re-processing ${priorJournal.size} journaled managed file(s))`);
   const nextFiles = { ...previous.files };
   const seen = new Set<string>();
   const pathRewriteFiles: string[] = [];
   const tokenFiles: string[] = [];
   const managedWritten: string[] = [];
+  // This run's write-ahead journal, persisted after each file-writing step.
+  const journal = new Set<string>();
+  const recordJournal = (paths: string[]): void => {
+    for (const p of paths) journal.add(relativeKey(p));
+    saveJournal(journal);
+  };
 
   // 1. skills + loader symlink
   {
@@ -753,7 +855,7 @@ function applyDeploy(version: string, bunBin: string, bunDir: string): void {
     for (const e of readdirSync(join(PAYLOAD, "skills"), { withFileTypes: true })) {
       if (e.name === "LifeOS") continue;
       if (!(e.isDirectory() || e.isFile())) continue;
-      const r = syncManagedTree(join(PAYLOAD, "skills", e.name), join(CR, "skills", e.name), previous, nextFiles, seen, resuming);
+      const r = syncManagedTree(join(PAYLOAD, "skills", e.name), join(CR, "skills", e.name), previous, nextFiles, seen, priorJournal);
       copied += r.copied;
       updated += r.updated;
       preserved += r.preserved;
@@ -769,21 +871,44 @@ function applyDeploy(version: string, bunBin: string, bunDir: string): void {
       pathRewriteFiles.push(...r.written);
     }
     failOnCopyErrors("skills synchronization", fails);
+    recordJournal(managedWritten);
     let linkNote = "";
     const link = join(CR, "skills", "LifeOS");
-    let linkEntryExists = false;
+    // Determine the current on-disk shape WITHOUT following the link.
+    let linkStat: ReturnType<typeof lstatSync> | null = null;
     try {
-      lstatSync(link);
-      linkEntryExists = true;
+      linkStat = lstatSync(link);
     } catch {}
-    if (!linkEntryExists) {
+    const isLoaderSymlink =
+      linkStat !== null && linkStat.isSymbolicLink() &&
+      (() => { try { return readlinkSync(link) === "../LifeOS"; } catch { return false; } })();
+    if (isLoaderSymlink) {
+      // Already the correct loader symlink — idempotent no-op.
+      linkNote = "skills/LifeOS symlink OK";
+    } else if (linkStat !== null) {
+      // Present but NOT the loader symlink. The old deployer COPIED
+      // install/skills/LifeOS/ as a real directory and enrolled its files in
+      // state; stale-cleanup removes managed FILES but never their DIRS, so the
+      // now-empty dir would permanently block the `../LifeOS` symlink and disable
+      // the loader. Also covers a wrong-target symlink or a stray file. Remove it,
+      // purge any enrolled `skills/LifeOS/**` keys (and mark them seen so
+      // stale-cleanup does not later walk them THROUGH the fresh symlink), then
+      // create the loader symlink.
+      for (const k of Object.keys(previous.files)) {
+        if (k === "skills/LifeOS" || k.startsWith("skills/LifeOS/")) {
+          delete nextFiles[k];
+          seen.add(k);
+        }
+      }
+      const wasDir = linkStat.isDirectory() && !linkStat.isSymbolicLink();
+      rmSync(link, { recursive: true, force: true });
+      mkdirSync(dirname(link), { recursive: true });
+      symlinkSync("../LifeOS", link); // relative → <CR>/LifeOS
+      linkNote = wasDir ? "skills/LifeOS migrated (copied dir → ../LifeOS symlink)" : "skills/LifeOS replaced → ../LifeOS symlink";
+    } else {
       mkdirSync(dirname(link), { recursive: true });
       symlinkSync("../LifeOS", link); // relative → <CR>/LifeOS
       linkNote = "skills/LifeOS → ../LifeOS created";
-    } else if (!existsSync(link)) {
-      die(`skills/LifeOS is a dangling symlink; remove or repair it before deploying`);
-    } else {
-      linkNote = "skills/LifeOS exists";
     }
     log(`  1. skills         copied ${copied}, updated ${updated}, preserved ${preserved}; ${linkNote}`);
     row("1 skills", copied, preserved, updated, linkNote);
@@ -796,7 +921,7 @@ function applyDeploy(version: string, bunBin: string, bunDir: string): void {
     const fails: string[] = [];
     for (const e of readdirSync(join(PAYLOAD, "LIFEOS"), { withFileTypes: true })) {
       if (runtimeSkip.has(e.name)) continue;
-      const r = syncManagedTree(join(PAYLOAD, "LIFEOS", e.name), join(RT, e.name), previous, nextFiles, seen, resuming);
+      const r = syncManagedTree(join(PAYLOAD, "LIFEOS", e.name), join(RT, e.name), previous, nextFiles, seen, priorJournal);
       copied += r.copied;
       updated += r.updated;
       preserved += r.preserved;
@@ -806,6 +931,7 @@ function applyDeploy(version: string, bunBin: string, bunDir: string): void {
       tokenFiles.push(...r.written);
     }
     failOnCopyErrors("runtime synchronization", fails);
+    recordJournal(managedWritten);
     log(`  2. runtime        copied ${copied}, updated ${updated}, preserved ${preserved} → ${RT}`);
     row("2 runtime", copied, preserved, updated);
   }
@@ -827,25 +953,27 @@ function applyDeploy(version: string, bunBin: string, bunDir: string): void {
 
   // 4. hooks
   {
-    const result = syncManagedTree(join(PAYLOAD, "hooks"), join(CR, "hooks"), previous, nextFiles, seen, resuming);
+    const result = syncManagedTree(join(PAYLOAD, "hooks"), join(CR, "hooks"), previous, nextFiles, seen, priorJournal);
     failOnCopyErrors("hooks synchronization", result.failures);
     managedWritten.push(...result.written);
     pathRewriteFiles.push(...result.written);
     tokenFiles.push(...result.written);
+    recordJournal(managedWritten);
     log(`  4. hooks          copied ${result.copied}, updated ${result.updated}, preserved ${result.preserved}`);
     row("4 hooks", result.copied, result.preserved, result.updated);
   }
 
   // 5. agents + commands
   {
-    const a = syncManagedTree(join(PAYLOAD, "agents"), join(CR, "agents"), previous, nextFiles, seen, resuming);
-    const c = syncManagedTree(join(PAYLOAD, "commands"), join(CR, "commands"), previous, nextFiles, seen, resuming);
+    const a = syncManagedTree(join(PAYLOAD, "agents"), join(CR, "agents"), previous, nextFiles, seen, priorJournal);
+    const c = syncManagedTree(join(PAYLOAD, "commands"), join(CR, "commands"), previous, nextFiles, seen, priorJournal);
     failOnCopyErrors("agents synchronization", a.failures);
     failOnCopyErrors("commands synchronization", c.failures);
     managedWritten.push(...a.written, ...c.written);
     // agents/commands carry hard-coded ~/.claude paths too → step-8 path-rewrite.
     pathRewriteFiles.push(...a.written, ...c.written);
     tokenFiles.push(...a.written, ...c.written);
+    recordJournal(managedWritten);
     log(`  5. agents         copied ${a.copied}, updated ${a.updated}, preserved ${a.preserved}; commands copied ${c.copied}, updated ${c.updated}, preserved ${c.preserved}`);
     row("5 agents", a.copied, a.preserved, a.updated);
     row("5 commands", c.copied, c.preserved, c.updated);
@@ -891,6 +1019,9 @@ function applyDeploy(version: string, bunBin: string, bunDir: string): void {
     const patched = pathRewriteFiles.includes(pathsFile) ? patchPathsTs() : "managed copy unchanged";
     // chmod +x on the statusline + hook scripts.
     const chmodCount = chmodExecutables();
+    // Re-persist the journal at this boundary: the same managed files now carry
+    // their transformed bytes, so a crash here still leaves an accurate record.
+    recordJournal(managedWritten);
     log(`  8. path-rewrite   ${rewritten.rewrites} rewrite(s) across ${rewritten.changed} managed file(s); paths.ts patch: ${patched}; chmod +x on ${chmodCount} script(s)`);
     row("8 path-rewrite", "", "", rewritten.rewrites, `${rewritten.changed} files; paths.ts ${patched}`);
   }
@@ -910,6 +1041,7 @@ function applyDeploy(version: string, bunBin: string, bunDir: string): void {
   // 9. token substitution
   {
     const applied = substituteManagedFiles(tokenFiles, tokenVars);
+    recordJournal(managedWritten);
     log(`  9. tokens         ${applied} substitution(s) applied`);
     row("9 tokens", "", "", applied);
   }
@@ -980,8 +1112,10 @@ function applyDeploy(version: string, bunBin: string, bunDir: string): void {
 
   for (const path of managedWritten) nextFiles[relativeKey(path)] = hashFile(path);
   saveDeployState(nextFiles);
-  // State is durable now: the deploy is complete and recoverable. Clear the
-  // crash-recovery breadcrumb so the next --apply is not treated as a resume.
+  // State is durable now: the deploy is complete and recoverable. Clear BOTH the
+  // crash-recovery breadcrumb and the write-ahead journal so the next --apply is
+  // not treated as a resume.
+  rmSync(JOURNAL_PATH, { force: true });
   rmSync(INPROGRESS_PATH, { force: true });
 
   log("");

@@ -546,9 +546,22 @@ F="$CMD_DIR/11_r6_configroot_lifeos.sh"   # was missing: run_case reused case 10
 write_case 11_r6_configroot_lifeos >/dev/null <<'CASE'
 set -euo pipefail
 source "$LP_RUN/env.sh"
-# (a) no quoted config-root-relative LIFEOS/ path strings survive in deployed code
-hits="$(grep -rE "['\"\`]LIFEOS/" "$L/hooks" "$RT/TOOLS" 2>/dev/null | grep -cv '@LIFEOS' || true)"
-[ "$hits" -eq 0 ] || { echo "R6a regression: $hits quoted LIFEOS/ path string(s) remain" >&2; exit 1; }
+# (a) no quoted config-root-relative LIFEOS/ PATH string survives in deployed
+# code. R6a DELIBERATELY exempts a "LIFEOS/…" literal that is the argument of a
+# string-matching method (rel.startsWith("LIFEOS/…"), p.includes('LIFEOS/USER/'),
+# value.startsWith("LIFEOS/")): those are comparison operands against external or
+# original-form relative paths, NOT filesystem paths to localize (see case 14 and
+# ReleaseAudit's release-privacy audit). Filter those out here too; anything that
+# REMAINS is a genuine un-localized path literal → regression.
+stray="$(grep -rnE "['\"\`]LIFEOS/" "$L/hooks" "$RT/TOOLS" 2>/dev/null \
+  | grep -v '@LIFEOS' \
+  | grep -vE "\.(startsWith|endsWith|includes|indexOf|lastIndexOf|match|search|split|replace|replaceAll)\([[:space:]]*['\"\`]LIFEOS/" \
+  || true)"
+if [ -n "$stray" ]; then
+  echo "R6a regression: quoted LIFEOS/ PATH string(s) remain (not string-method operands):" >&2
+  printf '%s\n' "$stray" >&2
+  exit 1
+fi
 # (b) no separate-arg 'LIFEOS' join args survive
 hits2="$(grep -rE "(join|resolve|pathResolve)\([^)]*['\"]LIFEOS['\"]" "$L/hooks" "$RT/TOOLS" 2>/dev/null | wc -l | tr -d ' ' || true)"  # grep exits 1 on 0 matches (pipefail)
 [ "$hits2" -eq 0 ] || { echo "R6b regression: $hits2 separate-arg 'LIFEOS' join(s) remain" >&2; exit 1; }
@@ -602,6 +615,64 @@ print('OK: package.json enrolled and hash matches on-disk (%s...)' % h[:12])
 PY
 CASE
 run_case 13_package_managed "$F"
+
+# ── 14. R6a semantic-comparison exemption (P1-1) ────────────────────────────
+# R6a localizes config-root-relative "LIFEOS/…" PATH strings to runtime/LIFEOS/,
+# but must NOT touch a "LIFEOS/…" literal that is a string-matching method's
+# argument — that is a comparison operand, not a path. The canonical case is
+# PULSE/Tools/ReleaseAudit.ts, whose rel.startsWith("LIFEOS/…") tests an EXTERNAL
+# staged release (rel = relative(STAGING, file), rooted at LIFEOS/); rewriting it
+# would silently break the release privacy audit. This asserts the comparisons
+# survive verbatim WHILE ReleaseAudit's own filesystem join AND a genuine
+# path-construction site elsewhere still localize.
+F="$CMD_DIR/14_r6a_semantic_exemption.sh"
+write_case 14_r6a_semantic_exemption >/dev/null <<'CASE'
+set -euo pipefail
+source "$LP_RUN/env.sh"
+ra="$RT/PULSE/Tools/ReleaseAudit.ts"
+test -f "$ra" || { echo "deployed ReleaseAudit.ts missing at $ra" >&2; exit 1; }
+# (a) the semantic startsWith("LIFEOS/…") comparisons survive VERBATIM.
+grep -qF 'startsWith("LIFEOS/USER/")' "$ra" || { echo "FAIL: startsWith(\"LIFEOS/USER/\") was rewritten" >&2; grep -n 'LIFEOS/USER' "$ra" >&2; exit 1; }
+grep -qF 'startsWith("LIFEOS/MEMORY/PULSE_DATA/")' "$ra" || { echo "FAIL: startsWith(\"LIFEOS/MEMORY/PULSE_DATA/\") was rewritten" >&2; grep -n 'PULSE_DATA' "$ra" >&2; exit 1; }
+# and none of them gained a runtime/ prefix (over-localization).
+if grep -q 'startsWith("runtime/LIFEOS/' "$ra"; then echo "FAIL: a semantic startsWith literal was localized" >&2; grep -n 'startsWith("runtime/LIFEOS/' "$ra" >&2; exit 1; fi
+# (b) ReleaseAudit's OWN filesystem join IS localized: upstream
+# join(homedir(), ".claude/LIFEOS/USER/CONFIG/release-audit-strings.json") baked
+# to the deployed runtime path (R2), losing ~/.claude.
+grep -qF "runtime/LIFEOS/USER/CONFIG/release-audit-strings.json" "$ra" || { echo "FAIL: ReleaseAudit fs join not localized" >&2; grep -n 'release-audit-strings' "$ra" >&2; exit 1; }
+if grep -q '\.claude/LIFEOS/USER/CONFIG/release-audit-strings' "$ra"; then echo "FAIL: ReleaseAudit still carries a ~/.claude fs join" >&2; exit 1; fi
+# (c) a genuine PATH-construction site elsewhere still localizes: MemoryHealthCheck
+# join(CLAUDE, "LIFEOS/TOOLS") → "runtime/LIFEOS/TOOLS".
+mh="$RT/TOOLS/MemoryHealthCheck.ts"
+grep -qF '"runtime/LIFEOS/TOOLS"' "$mh" || { echo "FAIL: MemoryHealthCheck path join not localized" >&2; grep -n 'LIFEOS/TOOLS' "$mh" >&2; exit 1; }
+echo "R6a semantic exemption OK (ReleaseAudit comparisons intact; its fs join + MemoryHealthCheck localized)"
+CASE
+run_case 14_r6a_semantic_exemption "$F"
+
+# ── 15. Handlebars templates are path-rewritten (P2-5) ──────────────────────
+# .hbs is in TEXT_EXT, so skills/Prompting/Templates/**.hbs get the step-8
+# rewrite: their `bun run ~/.claude/Skills/…` commands would otherwise hit the
+# real ~/.claude. The rewrite must strip ~/.claude while leaving Handlebars
+# {{…}} syntax intact (the rewrite rules never match {{…}}).
+F="$CMD_DIR/15_hbs_rewrite.sh"
+write_case 15_hbs_rewrite >/dev/null <<'CASE'
+set -euo pipefail
+source "$LP_RUN/env.sh"
+tdir="$L/skills/Prompting/Templates"
+test -d "$tdir" || { echo "deployed Handlebars templates dir missing: $tdir" >&2; exit 1; }
+n="$(find "$tdir" -name '*.hbs' | wc -l | tr -d ' ')"
+test "$n" -ge 2 || { echo "expected >=2 deployed .hbs templates, found $n" >&2; exit 1; }
+# No ~/.claude or $HOME/.claude survives in ANY deployed .hbs.
+leak="$(grep -rnE "~/\.claude|\\\$HOME/\.claude|\\\$\{HOME\}/\.claude" "$tdir" --include='*.hbs' || true)"
+if [ -n "$leak" ]; then echo "FAIL: ~/.claude survived in deployed .hbs:" >&2; printf '%s\n' "$leak" >&2; exit 1; fi
+# The specific commands were localized to the config root, and Handlebars vars
+# survive byte-for-byte.
+tc="$tdir/Evals/TestCase.hbs"
+grep -qF "$L/Skills/Evals/EvalServer/Lib/run-eval.ts" "$tc" || { echo "FAIL: TestCase.hbs run-eval path not localized to \$L" >&2; grep -n 'run-eval' "$tc" >&2; exit 1; }
+grep -qF '{{test_suite.name}}' "$tc" || { echo "FAIL: Handlebars {{test_suite.name}} corrupted in TestCase.hbs" >&2; exit 1; }
+echo "Handlebars rewrite OK ($n .hbs; 0 ~/.claude; {{…}} intact)"
+CASE
+run_case 15_hbs_rewrite "$F"
 
 # ════════════════════════════════════════════════════════════════════════════
 echo
