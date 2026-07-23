@@ -28,6 +28,7 @@
  */
 
 import {
+  appendFileSync,
   chmodSync,
   cpSync,
   existsSync,
@@ -67,27 +68,26 @@ const STATE_PATH = join(CR, ".lifeos-deploy-state.json");
 // hash stale or absent. On such a resume the WRITE-AHEAD JOURNAL (below) — not the
 // state hash — decides which managed files this deployer owns and may re-process.
 const INPROGRESS_PATH = join(CR, ".lifeos-deploy-inprogress");
-// Write-ahead journal: the set of managed keys the CURRENT --apply has actually
-// written, persisted after each file-writing step (steps 1,2,4,5 sync; step 8
-// rewrite; step 9 tokens) so an interruption at any step boundary leaves an
-// accurate record. It is the crash-recovery authority: on a resume (marker
-// present at startup) the PRIOR run's journal is loaded, and a managed
-// destination is re-processed — overwritten from source, re-enrolled, and
-// re-queued for the step-8 rewrite — IFF its key is in that journal, regardless
+// Write-ahead journal (append-log): the managed keys the CURRENT --apply has
+// written. It is a true WAL — one managed key per line, APPENDED immediately
+// BEFORE each managed write (every cpSync/writeFileSync site), so the journal
+// entry is durable on disk before the file it names ever exists. There is no
+// step-boundary flush and no in-memory buffer: each per-write append is
+// inherently durable, so a kill/power-loss at ANY point — even between the
+// append and the write — leaves an accurate (possibly over-inclusive) record,
+// never an under-inclusive one. It is the crash-recovery authority: on a resume
+// (marker present at startup) the PRIOR run's append-log is loaded, and a
+// managed destination is re-processed — overwritten from source, re-enrolled,
+// and re-queued for the step-8 rewrite — IFF its key is in that log, regardless
 // of whether the state hash exists or matches. This (a) re-enrolls a file the
 // crash left with new transformed bytes but a stale state hash (which plain
 // preserve semantics would strand from all future upstream updates), and (b)
 // never clobbers a genuine user file that merely collided with a managed path
-// (absent from the journal → preserved). Removed with the marker after
-// saveDeployState succeeds; a resume with no journal (or an unreadable one)
-// re-processes nothing, which is the safe default. Per-install state, gitignored.
+// (absent from the log → preserved). A fresh (non-resume) apply truncates any
+// stale log first; the log is removed with the marker after saveDeployState
+// succeeds. A resume with no log (or an unreadable one) re-processes nothing,
+// which is the safe default. Per-install state, gitignored.
 const JOURNAL_PATH = join(CR, ".lifeos-deploy-journal.json");
-// The live write-ahead journal set for the current --apply, armed once
-// applyDeploy starts. die() flushes it before exiting so EVERY failure path
-// (a mid-tree copy failure, a failed `bun install`, a missing dep) leaves an
-// accurate on-disk record of the files this run had already written — which a
-// resume then re-processes. Null during dry-run (nothing is written).
-let ACTIVE_JOURNAL: Set<string> | null = null;
 
 // ── args ──────────────────────────────────────────────────────────────
 const argv = process.argv.slice(2);
@@ -100,16 +100,22 @@ function log(msg = ""): void {
 }
 function die(msg: string): never {
   console.error(`\nFATAL: ${msg}`);
-  // Flush the write-ahead journal before aborting so a resume knows exactly
-  // which managed files this interrupted run had already written (and must
-  // re-process) — never leaving them stranded raw or misclassified as user
-  // files. Best-effort; a journal-write failure must not mask the real error.
-  if (ACTIVE_JOURNAL) {
-    try {
-      saveJournal(ACTIVE_JOURNAL);
-    } catch {}
-  }
+  // No journal flush needed: the write-ahead append-log persists each managed
+  // key BEFORE its write, so the on-disk record is already accurate at every
+  // possible abort point — including the failure paths that reach die().
   process.exit(1);
+}
+
+/**
+ * Write-ahead append: record a managed key as OWNED-AND-ABOUT-TO-BE-WRITTEN.
+ * MUST be called immediately before the cpSync/writeFileSync that materializes
+ * the key, so the durable journal entry precedes the file on disk (WAL ordering).
+ * The append-log is the single source of truth for crash recovery; a plain
+ * synchronous append is inherently durable, so no step-boundary flush is needed.
+ */
+function journalWrite(key: string): void {
+  mkdirSync(dirname(JOURNAL_PATH), { recursive: true });
+  appendFileSync(JOURNAL_PATH, key + "\n");
 }
 
 /** expandLeadingHome — reimplemented (importing InstallSettings.ts would run its
@@ -417,20 +423,20 @@ function syncManagedTree(
       assertSafeDestination(d);
       if (!existsSync(d)) {
         mkdirSync(dirname(d), { recursive: true });
+        journalWrite(key); // WAL: durable before the file exists
         cpSync(s, d);
         result.copied++;
         result.written.push(d);
-        if (ACTIVE_JOURNAL) ACTIVE_JOURNAL.add(key);
         return;
       }
 
       const destinationStat = lstatSync(d);
       const priorHash = previous.files[key];
       if (destinationStat.isFile() && priorHash && hashFile(d) === priorHash) {
+        journalWrite(key); // WAL: durable before the refresh overwrites
         cpSync(s, d);
         result.updated++;
         result.written.push(d);
-        if (ACTIVE_JOURNAL) ACTIVE_JOURNAL.add(key);
         return;
       }
 
@@ -439,10 +445,10 @@ function syncManagedTree(
       // whether the state hash is absent OR present-but-stale. Only regular
       // files; symlinks/dirs are never re-processed this way.
       if (journalKeys.has(key) && destinationStat.isFile()) {
+        journalWrite(key); // WAL: durable before the re-process overwrite
         cpSync(s, d);
         result.copied++;
         result.written.push(d);
-        if (ACTIVE_JOURNAL) ACTIVE_JOURNAL.add(key);
         return;
       }
 
@@ -487,41 +493,30 @@ function saveDeployState(files: Record<string, string>): void {
   renameSync(tmp, STATE_PATH);
 }
 
-interface DeployJournal {
-  version: 1;
-  keys: string[];
-}
-
 /**
- * Load the PRIOR run's write-ahead journal (crash recovery). Returns the set of
- * managed keys that run recorded as written. Any problem — missing file, bad
- * shape, an unsafe/non-managed key — yields an EMPTY set: with no trustworthy
- * evidence of ownership the resume re-processes nothing and preserves everything
- * on disk (never clobbers a user file). Only ever consulted when the in-progress
- * marker is present at startup.
+ * Load the PRIOR run's write-ahead append-log (crash recovery). The log is a
+ * line-based file — one managed key per line, appended before each write.
+ * Returns the set of valid managed keys it contains. Tolerant by design: a
+ * missing file, or a partial/garbled last line left by a mid-append crash, is
+ * simply skipped; every line is trimmed and filtered through isManagedKey and
+ * deduped into a Set. A non-managed or empty line contributes nothing, so the
+ * resume never treats junk as an owned file. Only ever consulted when the
+ * in-progress marker is present at startup.
  */
 function loadJournal(): Set<string> {
-  if (!existsSync(JOURNAL_PATH)) return new Set();
+  const keys = new Set<string>();
+  if (!existsSync(JOURNAL_PATH)) return keys;
+  let raw: string;
   try {
-    const parsed = JSON.parse(readFileSync(JOURNAL_PATH, "utf8")) as Partial<DeployJournal>;
-    if (parsed.version !== 1 || !Array.isArray(parsed.keys)) return new Set();
-    const keys = new Set<string>();
-    for (const key of parsed.keys) {
-      if (typeof key === "string" && isManagedKey(key)) keys.add(key);
-    }
-    return keys;
+    raw = readFileSync(JOURNAL_PATH, "utf8");
   } catch {
-    return new Set();
+    return keys;
   }
-}
-
-/** Persist THIS run's journal atomically. Called at every file-writing step
- * boundary so a crash leaves an accurate record of what was already written. */
-function saveJournal(keys: Set<string>): void {
-  const tmp = JOURNAL_PATH + ".tmp";
-  const journal: DeployJournal = { version: 1, keys: [...keys].sort() };
-  writeFileSync(tmp, JSON.stringify(journal, null, 2) + "\n");
-  renameSync(tmp, JOURNAL_PATH);
+  for (const line of raw.split("\n")) {
+    const key = line.trim();
+    if (key && isManagedKey(key)) keys.add(key);
+  }
+  return keys;
 }
 
 function failOnCopyErrors(label: string, failures: string[]): void {
@@ -845,7 +840,14 @@ function applyDeploy(version: string, bunBin: string, bunDir: string): void {
   // re-process. A resume with no journal (crash before any step persisted, or an
   // old marker-only install) re-processes nothing: the safe default.
   const resuming = existsSync(INPROGRESS_PATH);
+  // Load the prior run's append-log BEFORE truncating/appending anything, so the
+  // in-memory priorJournal snapshot drives re-processing decisions independently
+  // of the log we grow this run. On a fresh (non-resume) apply, discard any stale
+  // append-log so this run starts a clean WAL. On a resume we keep the existing
+  // log and append on top: prior entries stay durable through the resume window,
+  // so a second crash never loses a key the first crash recorded.
   const priorJournal = resuming ? loadJournal() : new Set<string>();
+  if (!resuming) rmSync(JOURNAL_PATH, { force: true });
   writeFileSync(INPROGRESS_PATH, new Date().toISOString() + "\n");
   if (resuming) log(`  (resuming an interrupted deploy — re-processing ${priorJournal.size} journaled managed file(s))`);
   const nextFiles = { ...previous.files };
@@ -853,15 +855,6 @@ function applyDeploy(version: string, bunBin: string, bunDir: string): void {
   const pathRewriteFiles: string[] = [];
   const tokenFiles: string[] = [];
   const managedWritten: string[] = [];
-  // This run's write-ahead journal, persisted after each file-writing step and
-  // flushed by die() on any failure path. Arm it module-side so die() and
-  // syncManagedTree (journal-on-write) reach the same set.
-  const journal = new Set<string>();
-  ACTIVE_JOURNAL = journal;
-  const recordJournal = (paths: string[]): void => {
-    for (const p of paths) journal.add(relativeKey(p));
-    saveJournal(journal);
-  };
 
   // 1. skills + loader symlink
   {
@@ -892,9 +885,25 @@ function applyDeploy(version: string, bunBin: string, bunDir: string): void {
       pathRewriteFiles.push(...r.written);
     }
     failOnCopyErrors("skills synchronization", fails);
-    recordJournal(managedWritten);
     let linkNote = "";
     const link = join(CR, "skills", "LifeOS");
+    // Purge any enrolled `skills/LifeOS` / `skills/LifeOS/**` keys from nextFiles
+    // and mark them seen. Run this whenever the final on-disk shape is (or has
+    // just become) the loader symlink — including the idempotent already-symlink
+    // case (P1-1): a prior run that migrated the copied dir and created the
+    // symlink, then crashed before saveDeployState, leaves those stale keys in
+    // previous.files. If they are not purged, the next run takes the no-op
+    // already-symlink branch and removeStaleManagedFiles later walks them THROUGH
+    // the now-symlink, tripping assertSafeDestination and aborting every future
+    // deploy. Marking them seen also stops stale-cleanup from following them.
+    const purgeSkillsLifeosKeys = (): void => {
+      for (const k of Object.keys(previous.files)) {
+        if (k === "skills/LifeOS" || k.startsWith("skills/LifeOS/")) {
+          delete nextFiles[k];
+          seen.add(k);
+        }
+      }
+    };
     // Determine the current on-disk shape WITHOUT following the link.
     let linkStat: ReturnType<typeof lstatSync> | null = null;
     try {
@@ -904,7 +913,10 @@ function applyDeploy(version: string, bunBin: string, bunDir: string): void {
       linkStat !== null && linkStat.isSymbolicLink() &&
       (() => { try { return readlinkSync(link) === "../LifeOS"; } catch { return false; } })();
     if (isLoaderSymlink) {
-      // Already the correct loader symlink — idempotent no-op.
+      // Already the correct loader symlink — idempotent no-op, but still purge any
+      // stale skills/LifeOS/** state (see purgeSkillsLifeosKeys) so a migrate-
+      // then-crash from a prior run cannot strand this deploy or any future one.
+      purgeSkillsLifeosKeys();
       linkNote = "skills/LifeOS symlink OK";
     } else if (linkStat !== null) {
       // Present but NOT the loader symlink. The old deployer COPIED
@@ -912,40 +924,48 @@ function applyDeploy(version: string, bunBin: string, bunDir: string): void {
       // state; stale-cleanup removes managed FILES but never their DIRS, so the
       // now-empty dir would permanently block the `../LifeOS` symlink and disable
       // the loader. Migrate it to the symlink — but PRESERVATION FIRST: only
-      // auto-delete a directory every file of which is a deploy-managed file
-      // still matching its recorded hash (a pristine old-format copy). A user's
-      // custom skills/LifeOS, or a managed dir carrying local edits, must never
-      // be silently deleted — stop with an actionable error instead.
+      // auto-delete a directory EVERY descendant of which is a deploy-managed,
+      // hash-matching REGULAR file (a pristine old-format copy). A user's custom
+      // skills/LifeOS, a managed dir carrying local edits, or a dir hiding a
+      // symlink / fifo / socket / device node must never be silently deleted —
+      // stop with an actionable error instead.
       const wasSymlink = linkStat.isSymbolicLink();
       const wasDir = linkStat.isDirectory() && !wasSymlink;
       if (wasDir) {
-        const offenders: string[] = [];
-        for (const f of walkFiles(link)) {
-          const k = relativeKey(f);
-          if (previous.files[k] === undefined || hashFile(f) !== previous.files[k]) {
-            offenders.push(k);
-            if (offenders.length >= 5) break;
+        // Inspect EVERY entry recursively via readdirSync(withFileTypes) — NOT
+        // walkFiles(), which silently skips symlinks (and thus would render a
+        // user-planted symlink/fifo invisible and let the rmSync below delete it).
+        // Returns the first offending path (relative key), or null if the whole
+        // tree is managed+hash-matching regular files.
+        const firstUnmanagedEntry = (root: string): string | null => {
+          for (const entry of readdirSync(root, { withFileTypes: true })) {
+            const p = join(root, entry.name);
+            if (entry.isSymbolicLink()) return relativeKey(p);
+            if (entry.isDirectory()) {
+              const nested = firstUnmanagedEntry(p);
+              if (nested) return nested;
+              continue;
+            }
+            if (!entry.isFile()) return relativeKey(p); // fifo/socket/device/etc.
+            const k = relativeKey(p);
+            if (previous.files[k] === undefined || hashFile(p) !== previous.files[k]) return k;
           }
-        }
-        if (offenders.length) {
-          die(`skills/LifeOS is a directory with unmanaged or locally-modified file(s) ` +
-            `(e.g. ${offenders[0]}) — refusing to delete it. Back it up and remove it ` +
-            `manually to enable the ../LifeOS loader symlink.`);
+          return null;
+        };
+        const offender = firstUnmanagedEntry(link);
+        if (offender) {
+          die(`skills/LifeOS is a directory with an unmanaged, locally-modified, or ` +
+            `non-regular entry (${offender}) — refusing to delete it. Back it up and ` +
+            `remove it manually to enable the ../LifeOS loader symlink.`);
         }
       } else if (!wasSymlink) {
         die(`skills/LifeOS is an unexpected regular file — remove it manually to ` +
           `enable the ../LifeOS loader symlink.`);
       }
       // Safe: a fully-managed old-format dir, or a wrong-target symlink (never
-      // user data). Purge any enrolled `skills/LifeOS/**` keys (and mark them
-      // seen so stale-cleanup does not later walk them THROUGH the fresh
-      // symlink), then create the loader symlink.
-      for (const k of Object.keys(previous.files)) {
-        if (k === "skills/LifeOS" || k.startsWith("skills/LifeOS/")) {
-          delete nextFiles[k];
-          seen.add(k);
-        }
-      }
+      // user data). Purge any enrolled skills/LifeOS/** keys, then create the
+      // loader symlink.
+      purgeSkillsLifeosKeys();
       rmSync(link, { recursive: true, force: true });
       mkdirSync(dirname(link), { recursive: true });
       symlinkSync("../LifeOS", link); // relative → <CR>/LifeOS
@@ -976,7 +996,6 @@ function applyDeploy(version: string, bunBin: string, bunDir: string): void {
       tokenFiles.push(...r.written);
     }
     failOnCopyErrors("runtime synchronization", fails);
-    recordJournal(managedWritten);
     log(`  2. runtime        copied ${copied}, updated ${updated}, preserved ${preserved} → ${RT}`);
     row("2 runtime", copied, preserved, updated);
   }
@@ -1003,7 +1022,6 @@ function applyDeploy(version: string, bunBin: string, bunDir: string): void {
     managedWritten.push(...result.written);
     pathRewriteFiles.push(...result.written);
     tokenFiles.push(...result.written);
-    recordJournal(managedWritten);
     log(`  4. hooks          copied ${result.copied}, updated ${result.updated}, preserved ${result.preserved}`);
     row("4 hooks", result.copied, result.preserved, result.updated);
   }
@@ -1018,7 +1036,6 @@ function applyDeploy(version: string, bunBin: string, bunDir: string): void {
     // agents/commands carry hard-coded ~/.claude paths too → step-8 path-rewrite.
     pathRewriteFiles.push(...a.written, ...c.written);
     tokenFiles.push(...a.written, ...c.written);
-    recordJournal(managedWritten);
     log(`  5. agents         copied ${a.copied}, updated ${a.updated}, preserved ${a.preserved}; commands copied ${c.copied}, updated ${c.updated}, preserved ${c.preserved}`);
     row("5 agents", a.copied, a.preserved, a.updated);
     row("5 commands", c.copied, c.preserved, c.updated);
@@ -1032,8 +1049,8 @@ function applyDeploy(version: string, bunBin: string, bunDir: string): void {
     const { json, rewrites, strippedHooks } = buildSettings();
     seen.add(key);
     if (!existsSync(settingsPath)) {
+      journalWrite(key); // WAL: durable before the write
       writeFileSync(settingsPath, json);
-      recordJournal([settingsPath]);
       log(`  6. settings.json  CREATED (${strippedHooks} SessionStart backport hook(s) stripped; ${rewrites} path rewrite(s); env expanded)${FULL ? "; +statusLine +spinner" : ""}`);
       row("6 settings.json", "created", "", rewrites, FULL ? "full: statusLine+spinner" : "");
       nextFiles[key] = hashFile(settingsPath);
@@ -1042,8 +1059,8 @@ function applyDeploy(version: string, bunBin: string, bunDir: string): void {
         log(`  6. settings.json  managed and current`);
         row("6 settings.json", "-", "current");
       } else {
+        journalWrite(key); // WAL: durable before the write
         writeFileSync(settingsPath, json);
-        recordJournal([settingsPath]);
         log(`  6. settings.json  UPDATED (${strippedHooks} SessionStart backport hook(s) stripped; ${rewrites} path rewrite(s); env expanded)${FULL ? "; +statusLine +spinner" : ""}`);
         row("6 settings.json", "updated", "", rewrites, FULL ? "full: statusLine+spinner" : "");
       }
@@ -1054,8 +1071,8 @@ function applyDeploy(version: string, bunBin: string, bunDir: string): void {
       // it is journaled but unenrolled. Regenerate from payload and enroll —
       // plain preserve semantics would strand it (never enhanced by --full,
       // never refreshed).
+      journalWrite(key); // WAL: durable before the write
       writeFileSync(settingsPath, json);
-      recordJournal([settingsPath]);
       nextFiles[key] = hashFile(settingsPath);
       log(`  6. settings.json  RESUMED (rewritten from payload; ${rewrites} path rewrite(s))`);
       row("6 settings.json", "resumed", "", rewrites);
@@ -1075,11 +1092,10 @@ function applyDeploy(version: string, bunBin: string, bunDir: string): void {
     // paths.ts patch: getClaudeDir() must honor CLAUDE_CONFIG_DIR first.
     const pathsFile = join(CR, "hooks", "lib", "paths.ts");
     const patched = pathRewriteFiles.includes(pathsFile) ? patchPathsTs() : "managed copy unchanged";
-    // chmod +x on the statusline + hook scripts.
-    const chmodCount = chmodExecutables();
-    // Re-persist the journal at this boundary: the same managed files now carry
-    // their transformed bytes, so a crash here still leaves an accurate record.
-    recordJournal(managedWritten);
+    // chmod +x the statusline + ONLY the hook scripts THIS deploy actually wrote
+    // (P2-4): a user's private hook that sync PRESERVED must not be made
+    // world-exec, so pass the managed-written key set as the allow-list.
+    const chmodCount = chmodExecutables(new Set(managedWritten.map(relativeKey)));
     log(`  8. path-rewrite   ${rewritten.rewrites} rewrite(s) across ${rewritten.changed} managed file(s); paths.ts patch: ${patched}; chmod +x on ${chmodCount} script(s)`);
     row("8 path-rewrite", "", "", rewritten.rewrites, `${rewritten.changed} files; paths.ts ${patched}`);
   }
@@ -1099,7 +1115,6 @@ function applyDeploy(version: string, bunBin: string, bunDir: string): void {
   // 9. token substitution
   {
     const applied = substituteManagedFiles(tokenFiles, tokenVars);
-    recordJournal(managedWritten);
     log(`  9. tokens         ${applied} substitution(s) applied`);
     row("9 tokens", "", "", applied);
   }
@@ -1136,12 +1151,18 @@ function applyDeploy(version: string, bunBin: string, bunDir: string): void {
     assertSafeDestination(pkgDst);
     const key = relativeKey(pkgDst);
     seen.add(key);
+    // WAL: each write path journals the key BEFORE its cpSync, so package.json is
+    // recorded durably before it exists — and thus before the fallible `bun
+    // install` below — leaving it recoverable rather than stranded pre-existing
+    // if the install (or anything after) fails. The preserve path writes nothing.
     let note: string;
     if (!existsSync(pkgDst)) {
+      journalWrite(key);
       cpSync(pkgSrc, pkgDst);
       nextFiles[key] = hashFile(pkgDst);
       note = "written";
     } else if (previous.files[key] && hashFile(pkgDst) === previous.files[key]) {
+      journalWrite(key);
       cpSync(pkgSrc, pkgDst);
       nextFiles[key] = hashFile(pkgDst);
       note = "refreshed";
@@ -1149,6 +1170,7 @@ function applyDeploy(version: string, bunBin: string, bunDir: string): void {
       // Crash recovery: journaled by a prior interrupted run (bun install failed
       // here last time) but never enrolled. Refresh from payload and enroll so
       // future dependency bumps are picked up, instead of preserving it forever.
+      journalWrite(key);
       cpSync(pkgSrc, pkgDst);
       nextFiles[key] = hashFile(pkgDst);
       note = "resumed";
@@ -1156,9 +1178,6 @@ function applyDeploy(version: string, bunBin: string, bunDir: string): void {
       delete nextFiles[key];
       note = "preserved";
     }
-    // Journal package.json BEFORE the fallible `bun install`, so an install
-    // failure still leaves it recoverable rather than stranded pre-existing.
-    if (note !== "preserved") recordJournal([pkgDst]);
     log(` 12. deps           package.json ${note}; running bun install...`);
     const proc = Bun.spawnSync(["bun", "install"], { cwd: CR, stdout: "pipe", stderr: "pipe" });
     if (proc.exitCode !== 0) {
@@ -1211,8 +1230,14 @@ function patchPathsTs(): string {
   return "patched";
 }
 
-/** chmod +x the statusline script and every *.hook.ts / *.hook.sh under hooks/. */
-function chmodExecutables(): number {
+/**
+ * chmod +x the statusline script (always deployer-managed) plus every
+ * *.hook.ts / *.hook.sh under hooks/ that THIS deploy actually wrote. A hook
+ * whose key is NOT in `managedKeys` is a file the sync preserved (a user's
+ * private custom hook, or any pre-existing file colliding with hooks/) and is
+ * left with its original mode — never forced to 0755 (P2-4).
+ */
+function chmodExecutables(managedKeys: Set<string>): number {
   let n = 0;
   const status = join(RT, "LIFEOS_StatusLine.sh");
   if (existsSync(status)) {
@@ -1220,10 +1245,10 @@ function chmodExecutables(): number {
     n++;
   }
   for (const f of walkFiles(join(CR, "hooks"))) {
-    if (f.endsWith(".hook.ts") || f.endsWith(".hook.sh")) {
-      chmodSync(f, 0o755);
-      n++;
-    }
+    if (!(f.endsWith(".hook.ts") || f.endsWith(".hook.sh"))) continue;
+    if (!managedKeys.has(relativeKey(f))) continue; // preserved user hook → untouched
+    chmodSync(f, 0o755);
+    n++;
   }
   return n;
 }

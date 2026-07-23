@@ -72,6 +72,21 @@ LP_RUN="$(mktemp -d "$TMP_ROOT/lifeos-runtime-e2e.XXXXXX")"
 # deployed settings.json / paths.ts carry /private/var/... . Resolve here so the
 # suite's expected paths match the deployed ones exactly.
 LP_RUN="$(cd "$LP_RUN" && pwd -P)"
+
+# Detached HEAD (e.g. a CI checkout of a bare commit) with no LP_E2E_BRANCH
+# override leaves SRC_BRANCH empty, which would make the install's `--branch ""`
+# fail. Only when the source is ALSO derived from the primary checkout (no
+# LP_E2E_SOURCE override) do we build a throwaway bare mirror under the run root,
+# materialize a real branch name at HEAD by fetching this checkout's HEAD (never
+# creating a branch in the primary checkout), and point the install at it. The
+# normal attached-branch path is untouched.
+if [ -z "$SRC_BRANCH" ] && [ -z "${LP_E2E_SOURCE:-}" ]; then
+  SRC_MIRROR="$LP_RUN/lifeos-src.git"
+  git clone --quiet --bare "$PRIMARY_CHECKOUT" "$SRC_MIRROR"
+  git -C "$SRC_MIRROR" fetch --quiet "$REPO_ROOT" "HEAD:refs/heads/lp-e2e-head"
+  SRC_URL="file://$SRC_MIRROR"
+  SRC_BRANCH="lp-e2e-head"
+fi
 HOME_DIR="$LP_RUN/home"
 PB_DIR="$LP_RUN/playbooks"
 SHELL_CFG="$LP_RUN/zshrc"
