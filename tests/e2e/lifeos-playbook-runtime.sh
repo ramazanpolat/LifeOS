@@ -11,15 +11,15 @@
 #
 # Philosophy: assert playbook PACKAGING invariants. Upstream quirks are in scope
 # only as "must be preserved verbatim" (porting fidelity), never as things to
-# fix. Known-accepted and NOT flagged: the TOOLS *.plist.template files keep
-# __HOME__/~/.claude (last-segment ext .template, out of TEXT_EXT — each is
-# materialized against the real ~/.claude by its OWN installer, out of P1-2's
-# scope); {{DA_NAME}}/{{PRINCIPAL_NAME}} placeholders remain until the Interview.
-# NOTE (P1-2/P1-3): the PULSE launchd/systemd service templates (.plist/.service)
-# and PULSE code paths are now LOCALIZED to the config root — no longer left on
-# home forms. Their __HOME__/.claude and `process.env.HOME ?? "~"`-before-.claude
-# escapes are rewritten (see case 16); a bare __HOME__ used for a non-.claude path
-# is preserved for Pulse's own substitution.
+# fix. Known-accepted and NOT flagged: {{DA_NAME}}/{{PRINCIPAL_NAME}}
+# placeholders remain until the Interview.
+# NOTE (P1-2/P1-3, round 6): every payload file type that carried a .claude path —
+# the PULSE launchd/systemd service templates (.plist/.service), the TOOLS
+# *.plist.template launchd job templates (.template, {{HOME}} token), the PULSE
+# UI (.tsx) and menu-bar app (.swift), and PULSE code paths (incl. nullish
+# `process.env.HOME ?? "~"`-before-.claude) — is now LOCALIZED to the config root
+# (see cases 16/16b). A bare __HOME__/{{HOME}} used for a non-.claude path is
+# preserved for the service installer's own substitution pass.
 #
 # Harness: driven through a real herdr pane in a DEDICATED workspace
 # (lifeos-e2e-runtime). Cases run in that pane; completion is detected via a
@@ -744,6 +744,26 @@ done
 echo "PULSE localization OK (.plist/.service on <RT>; bare __HOME__ preserved; 0 nullish-HOME .claude escapes)"
 CASE
 run_case 16_pulse_localized "$F"
+
+# 16b — the round-6 extended extensions (.template launchd job templates,
+# .tsx Pulse UI + dashboard/report templates, .swift menu-bar app) are now in
+# TEXT_EXT and must carry 0 home-form .claude escapes after deploy.
+F="$CMD_DIR/16b_extended_exts_localized.sh"
+write_case 16b_extended_exts_localized >/dev/null <<'CASE'
+set -euo pipefail
+source "$LP_RUN/env.sh"
+esc='(__HOME__|\{\{HOME\}\}|~|\$HOME|\$\{HOME\})/\.claude'
+for ext in template tsx swift; do
+  hits="$(grep -rlE "$esc" "$RT" --include="*.$ext" 2>/dev/null || true)"
+  if [ -n "$hits" ]; then echo "FAIL: home-form .claude paths survive in deployed *.$ext:" >&2; printf '%s\n' "$hits" >&2; exit 1; fi
+done
+# the WorkSweep launchd job template now points its ProgramArguments at the
+# config-root runtime, not {{HOME}}/.claude.
+tmpl="$(ls "$RT"/TOOLS/*.plist.template 2>/dev/null | head -1)"
+[ -n "$tmpl" ] && grep -qF "$RT/TOOLS" "$tmpl" || { echo "FAIL: launchd job template not localized to <RT>/TOOLS" >&2; exit 1; }
+echo "extended-ext localization OK (.template/.tsx/.swift carry 0 .claude escapes)"
+CASE
+run_case 16b_extended_exts_localized "$F"
 
 # ════════════════════════════════════════════════════════════════════════════
 echo

@@ -195,6 +195,19 @@ const RULES: Rule[] = [
   //        <CR>). Idempotent — the rewritten absolute paths contain no `__HOME__`.
   { name: "RH1", re: new RegExp("__HOME__/\\.claude/LIFEOS" + BOUND, "g"), rep: () => RT },
   { name: "RH4", re: new RegExp("__HOME__/\\.claude" + BOUND, "g"), rep: () => CR },
+  // RB1 / RB4 — the `{{HOME}}` template token (P1, round 6). The ten TOOLS
+  //        `*.plist.template` launchd job templates hard-code `{{HOME}}/.claude/
+  //        LIFEOS/…`. `{{HOME}}` is a substituteTree token normally replaced with
+  //        the REAL home at step 9 — correct for the upstream real-~/.claude
+  //        installer, WRONG for a playbook, where the materialized launchd job
+  //        must run under this checkout's runtime/LIFEOS. These fire at step 8
+  //        (BEFORE the step-9 `{{HOME}}`→real-home substitution) and ONLY when
+  //        `{{HOME}}` is immediately followed by `/.claude`: a bare `{{HOME}}`
+  //        (a non-.claude path, e.g. a Library log dir) keeps the token for
+  //        step 9. Longest-first: RB1 (…/.claude/LIFEOS → <RT>) before RB4
+  //        (…/.claude → <CR>). Idempotent — rewritten absolute paths carry no token.
+  { name: "RB1", re: new RegExp("\\{\\{HOME\\}\\}/\\.claude/LIFEOS" + BOUND, "g"), rep: () => RT },
+  { name: "RB4", re: new RegExp("\\{\\{HOME\\}\\}/\\.claude" + BOUND, "g"), rep: () => CR },
   // Rrel — relative-import fixup. Upstream ships `../../../.claude/hooks/...`
   //        assuming the runtime sits directly under the config root (~/.claude/
   //        LIFEOS/...). In this layout the runtime is one level deeper
@@ -315,12 +328,21 @@ function rewriteText(content: string): { text: string; count: number } {
 // runtime pass) is what keeps the generated unit pointed at this checkout, not
 // the real ~/.claude. Only the three PULSE `.plist` + one `.service` payload
 // files carry `__HOME__`; they hold no `{{…}}` deploy tokens, so step-9 token
-// substitution is a no-op on them. `.template` is deliberately NOT added: the ten
-// TOOLS `*.plist.template` files (last-segment ext `.template`) carry their OWN
-// `{{…}}`/`$HOME`/`~` template forms meant for a separate real-~/.claude
-// installer, and are out of P1-2's PULSE scope — adding `.template` would
-// prematurely rewrite/substitute them.
-const TEXT_EXT = new Set([".ts", ".js", ".sh", ".json", ".md", ".yaml", ".yml", ".toml", ".txt", ".hbs", ".plist", ".service"]);
+// substitution is a no-op on them.
+//
+// `.template` (the ten TOOLS `*.plist.template` launchd job templates, ext
+// `.template`) IS included: in a playbook there is no separate real-~/.claude
+// installer — bin/deploy.ts is the installer — so their `{{HOME}}/.claude/…`
+// paths must localize to this checkout, not the real home. RB1/RB4 rewrite the
+// `{{HOME}}/.claude` prefix at step 8 (BEFORE step-9's `{{HOME}}`→real-home
+// substitution), so a materialized launchd job runs under runtime/LIFEOS; any
+// bare `{{HOME}}` (a non-.claude path, e.g. a Library log dir) is left for
+// step 9. `.tsx` (Pulse UI components + skill dashboard/report templates) and
+// `.swift` (the Pulse menu-bar app) are included so their user-facing
+// `~/.claude/LIFEOS/…` paths and runnable `bun ~/.claude/…` commands localize
+// too. substituteTree only replaces known tokens, so JSX `{{ … }}` object
+// literals in .tsx are left intact.
+const TEXT_EXT = new Set([".ts", ".js", ".sh", ".json", ".md", ".yaml", ".yml", ".toml", ".txt", ".hbs", ".plist", ".service", ".template", ".tsx", ".swift"]);
 const WALK_SKIP = new Set(["node_modules", ".git", ".DS_Store"]);
 
 function* walkFiles(dir: string, skip: Set<string> = WALK_SKIP): Generator<string> {
@@ -1035,6 +1057,10 @@ function applyDeploy(version: string, bunBin: string, bunDir: string): void {
     let made = 0;
     for (const s of subs) {
       const d = join(RT, "MEMORY", s);
+      // Guard against a pre-existing symlink anywhere on the path (e.g. a
+      // MEMORY symlink pointing outside the checkout): mkdirSync(recursive)
+      // would follow it and scaffold dirs outside the isolation boundary.
+      assertSafeDestination(d);
       if (!existsSync(d)) {
         mkdirSync(d, { recursive: true });
         made++;

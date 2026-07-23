@@ -842,6 +842,29 @@ echo "OK 09i_statusline_chmod_preserved"
 CASE
 )"
 
+# 09j MEMORY scaffold refuses to write through a pre-existing symlink -----------
+c09j="$(write_case 09j_memory_symlink_guard <<'CASE'
+set -euo pipefail
+source "$LP_E2E_ENV"
+cd "$LP_INSTALL"
+# Replace runtime/LIFEOS/MEMORY with a symlink pointing OUTSIDE the checkout.
+# The scaffold must refuse (assertSafeDestination) rather than mkdir -p through
+# it and create dirs beyond the isolation boundary.
+outside="$LP_E2E_RUN_ROOT/memory-escape"
+rm -rf "$outside" runtime/LIFEOS/MEMORY
+mkdir -p "$outside"
+ln -s "$outside" runtime/LIFEOS/MEMORY
+if out="$(bun bin/deploy.ts --apply 2>&1)"; then
+  echo "FAIL: deploy did not reject the MEMORY symlink" >&2; printf '%s\n' "$out" >&2; exit 1
+fi
+printf '%s\n' "$out" | grep -qi 'refusing to write through symlink' || { echo "FAIL: no symlink-refusal message" >&2; printf '%s\n' "$out" >&2; exit 1; }
+test "$(ls -A "$outside" | wc -l | tr -d ' ')" = "0" || { echo "FAIL: dirs were scaffolded outside the checkout" >&2; exit 1; }
+# restore a real MEMORY dir so the install is left healthy
+rm -f runtime/LIFEOS/MEMORY; mkdir -p runtime/LIFEOS/MEMORY
+echo "OK 09j_memory_symlink_guard"
+CASE
+)"
+
 # 10 delete -------------------------------------------------------------------
 c10="$(write_case 10_delete <<'CASE'
 set -euo pipefail
@@ -877,6 +900,7 @@ run_case "$P_MAIN" 09f_skills_unmanaged_left_untouched "$c09f"
 run_case "$P_MAIN" 09g_skills_nested_symlink_left_untouched "$c09g"
 run_case "$P_MAIN" 09h_user_hook_chmod_preserved "$c09h"
 run_case "$P_MAIN" 09i_statusline_chmod_preserved "$c09i"
+run_case "$P_MAIN" 09j_memory_symlink_guard "$c09j"
 run_case "$P_MAIN" 10_delete           "$c10"
 
 # ── report ─────────────────────────────────────────────────────────────
