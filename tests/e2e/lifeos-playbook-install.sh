@@ -318,7 +318,8 @@ test -f "$LP_INSTALL/.lifeos-deploy-state.json"
 # The shared payload keeps normal-installer defaults; only the deployed USER
 # copy is localized for the playbook layout.
 grep -q 'user_dir = "~/.claude/LIFEOS/USER"' LifeOS/install/USER/CONFIG/LIFEOS_CONFIG.toml
-grep -Fq "user_dir = \"$LP_INSTALL/USER\"" USER/CONFIG/LIFEOS_CONFIG.toml
+install_real="$(pwd -P)"
+grep -Fq "user_dir = \"$install_real/USER\"" USER/CONFIG/LIFEOS_CONFIG.toml
 # Baseline settings.json hash for the idempotency / create-only / update cases.
 shasum -a 256 "$LP_INSTALL/settings.json" | awk '{print $1}' > "$LP_E2E_RUN_ROOT/settings-baseline.hash"
 echo "OK 04_deploy_apply"
