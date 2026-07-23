@@ -364,6 +364,43 @@ echo "OK 06_idempotency"
 CASE
 )"
 
+# 06b package.json is deploy-managed by hash (P2-a) ---------------------------
+c06b="$(write_case 06b_package_managed <<'CASE'
+set -euo pipefail
+source "$LP_E2E_ENV"
+cd "$LP_INSTALL"
+pay="LifeOS/install/package.json"
+# Enrolled in the deploy state after the initial deploy (not copy-if-missing).
+python3 - <<'PY'
+import json, sys
+st = json.load(open('.lifeos-deploy-state.json'))
+if not st.get('files', {}).get('package.json'):
+    print('FAIL: package.json not enrolled in .lifeos-deploy-state.json'); sys.exit(1)
+print('enrolled OK')
+PY
+# REFRESH: an upstream package.json change is picked up on the next deploy
+# (whereas the old copy-if-missing left it stale). Add a marker field to the
+# payload manifest, then redeploy. (yaml stays the only dep → bun install offline.)
+python3 - "$pay" <<'PY'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p)); d['lifeosDeployTestMarker'] = 'REFRESH_OK'
+json.dump(d, open(p, 'w'), indent=2)
+PY
+out="$(bun bin/deploy.ts --apply 2>&1)"
+grep -q 'Deploy complete' <<<"$out"
+grep -q 'lifeosDeployTestMarker' package.json || { echo "FAIL: payload package.json change not refreshed into deployed package.json" >&2; exit 1; }
+grep -q 'REFRESH_OK' package.json
+# RESTORE the payload + redeploy so the deployed manifest returns to pristine and
+# the tree is clean-except-.playbook for the remaining lifecycle cases.
+git checkout -- "$pay"
+out2="$(bun bin/deploy.ts --apply 2>&1)"
+grep -q 'Deploy complete' <<<"$out2"
+if grep -q 'lifeosDeployTestMarker' package.json; then echo "FAIL: marker not cleared after payload restore+redeploy" >&2; exit 1; fi
+test "$(git status --porcelain)" = " M .playbook" || { echo "FAIL: tree not clean-except-.playbook after package.json case:" >&2; git status --porcelain >&2; exit 1; }
+echo "OK 06b_package_managed"
+CASE
+)"
+
 # 07 full tier: safely refresh managed settings on an EXISTING install --------
 c07="$(write_case 07_full_upgrade <<'CASE'
 set -euo pipefail
@@ -410,6 +447,11 @@ set -euo pipefail
 source "$LP_E2E_ENV"
 cd "$LP_INSTALL"
 baseline="$(cat "$LP_E2E_RUN_ROOT/settings-baseline.hash")"
+# The CLI injected a [source] branch into .playbook at install → .playbook is
+# locally modified. Capture it: the update must preserve it across the pull even
+# when the incoming commit ALSO changes .playbook (a version bump), which a plain
+# `git pull --ff-only` would otherwise refuse.
+pb_branch_before="$(grep '^branch = ' .playbook || true)"
 if [ -n "$LP_TEST_REMOTE" ]; then
   publisher="$LP_E2E_RUN_ROOT/publisher"
   git clone --quiet "$LP_SOURCE" "$publisher"
@@ -418,14 +460,20 @@ if [ -n "$LP_TEST_REMOTE" ]; then
   git -C "$publisher" config user.email "lifeos-e2e@example.invalid"
   printf '\nUPSTREAM_REFRESH_MARKER\n' >> "$publisher/LifeOS/install/commands/context-search.md"
   printf '\nUPSTREAM_CONFLICT_MARKER\n' >> "$publisher/LifeOS/install/commands/cs.md"
-  git -C "$publisher" add LifeOS/install/commands/context-search.md LifeOS/install/commands/cs.md
-  git -C "$publisher" commit --quiet -m "test: publish managed payload update"
+  # Bump the upstream .playbook version: this makes the incoming commit touch
+  # .playbook, so a pre-fix `git pull --ff-only` would REFUSE ("local changes to
+  # .playbook would be overwritten"). The update script must preserve the
+  # injected [source] and still take the upstream version.
+  sed 's/^version = .*/version = "9.9.9-e2e"/' "$publisher/.playbook" > "$publisher/.playbook.new"
+  mv "$publisher/.playbook.new" "$publisher/.playbook"
+  git -C "$publisher" add LifeOS/install/commands/context-search.md LifeOS/install/commands/cs.md .playbook
+  git -C "$publisher" commit --quiet -m "test: publish managed payload update + version bump"
   git -C "$publisher" push --quiet origin "$LP_BRANCH"
   printf '\nLOCAL_CUSTOMIZATION_MARKER\n' >> commands/cs.md
 fi
 out="$(cpb update lifeos 2>&1)"
 printf '%s\n' "$out"
-# ff-only pull + idempotent redeploy.
+# ff-only pull + idempotent redeploy — must NOT refuse despite the .playbook change.
 grep -qi 'fast-forward only' <<<"$out"
 grep -qi 're-deploying' <<<"$out"
 grep -q 'Deploy complete' <<<"$out"
@@ -436,6 +484,12 @@ if [ -n "$LP_TEST_REMOTE" ]; then
   if grep -q 'UPSTREAM_CONFLICT_MARKER' commands/cs.md; then
     echo "FAIL: update overwrote a locally customized managed file" >&2
     exit 1
+  fi
+  # The upstream version bump landed AND the injected [source] survived.
+  grep -q '^version = "9.9.9-e2e"' .playbook || { echo "FAIL: upstream .playbook version not applied" >&2; cat .playbook >&2; exit 1; }
+  test "$(grep -c '^\[source\]' .playbook)" = "1" || { echo "FAIL: [source] section duplicated/lost" >&2; cat .playbook >&2; exit 1; }
+  if [ -n "$pb_branch_before" ]; then
+    grep -qF "$pb_branch_before" .playbook || { echo "FAIL: injected [source] branch lost across update" >&2; cat .playbook >&2; exit 1; }
   fi
 fi
 # Existing managed settings remain stable when their payload did not change.
@@ -466,6 +520,36 @@ echo "OK 09_update_dirty_guard"
 CASE
 )"
 
+# 09b interrupted-deploy recovery (P2-b) --------------------------------------
+c09b="$(write_case 09b_interrupted_recovery <<'CASE'
+set -euo pipefail
+source "$LP_E2E_ENV"
+cd "$LP_INSTALL"
+# Simulate a crash mid-deploy: a managed file was copied RAW (before the step-8
+# path-rewrite), then the run died before saveDeployState — so the state json is
+# gone and the in-progress marker is left behind. A naive redeploy would see the
+# raw file with no recorded hash, treat it as pre-existing, and PRESERVE it,
+# stranding the hard-coded ~/.claude path. The marker must make the deployer
+# re-adopt (re-copy + re-rewrite) it.
+victim="hooks/PreToolGuard.hook.ts"
+test -f "$victim"
+printf '\nconst LEFTOVER_RAW = "~/.claude/LIFEOS/TOOLS/Stranded.ts";\n' >> "$victim"
+grep -q '~/.claude' "$victim"                 # raw path present pre-recovery
+rm -f .lifeos-deploy-state.json               # crash: state never persisted
+: > .lifeos-deploy-inprogress                 # crash: marker left behind
+out="$(bun bin/deploy.ts --apply 2>&1)"
+printf '%s\n' "$out"
+grep -qi 'resuming an interrupted deploy' <<<"$out"
+grep -q 'Deploy complete' <<<"$out"
+# Re-adopted (re-copied from payload + path-rewritten): the raw path is gone.
+if grep -q '~/.claude' "$victim"; then echo "FAIL: raw ~/.claude survived recovery in $victim" >&2; grep -n '~/.claude' "$victim" >&2; exit 1; fi
+# Marker cleared after a successful, state-persisted deploy; state rebuilt.
+test ! -e .lifeos-deploy-inprogress || { echo "FAIL: .lifeos-deploy-inprogress not removed after recovery" >&2; exit 1; }
+test -f .lifeos-deploy-state.json
+echo "OK 09b_interrupted_recovery"
+CASE
+)"
+
 # 10 delete -------------------------------------------------------------------
 c10="$(write_case 10_delete <<'CASE'
 set -euo pipefail
@@ -488,10 +572,12 @@ run_case "$P_MAIN" 03_deploy_dryrun    "$c03"
 run_case "$P_MAIN" 04_deploy_apply     "$c04"
 run_case "$P_MAIN" 05_gitignore        "$c05"
 run_case "$P_MAIN" 06_idempotency      "$c06"
+run_case "$P_MAIN" 06b_package_managed "$c06b"
 run_case "$P_MAIN" 07_full_upgrade     "$c07"
 run_case "$P_AUX"  07b_full_fresh      "$c07b"
 run_case "$P_MAIN" 08_update_happy     "$c08"
 run_case "$P_MAIN" 09_update_dirty_guard "$c09"
+run_case "$P_MAIN" 09b_interrupted_recovery "$c09b"
 run_case "$P_MAIN" 10_delete           "$c10"
 
 # ── report ─────────────────────────────────────────────────────────────

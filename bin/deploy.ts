@@ -58,6 +58,13 @@ const RT = join(CR, "runtime", "LIFEOS");
 const PAYLOAD = join(CR, "LifeOS", "install");
 const REAL_HOME = homedir();
 const STATE_PATH = join(CR, ".lifeos-deploy-state.json");
+// Crash-recovery breadcrumb: written at the start of an --apply and removed only
+// after saveDeployState succeeds. Its presence at the start of a later --apply
+// means a previous run died mid-deploy (e.g. `bun install` failed) before its
+// state was persisted, so managed destinations may be sitting on disk raw
+// (pre-path-rewrite) with no recorded hash. See the `adopt` path in
+// syncManagedTree for how a resumed run re-processes them.
+const INPROGRESS_PATH = join(CR, ".lifeos-deploy-inprogress");
 
 // ── args ──────────────────────────────────────────────────────────────
 const argv = process.argv.slice(2);
@@ -241,7 +248,7 @@ function relativeKey(path: string): string {
 }
 
 function isManagedKey(key: string): boolean {
-  return key === "settings.json" ||
+  return key === "settings.json" || key === "package.json" ||
     ["skills/", "runtime/LIFEOS/", "hooks/", "agents/", "commands/"].some((prefix) => key.startsWith(prefix));
 }
 
@@ -300,6 +307,17 @@ function loadDeployState(): DeployState {
  * Synchronize a system-managed tree. A previously deployed file is refreshed
  * only when its current hash still matches the deploy state; locally edited or
  * pre-existing files are preserved.
+ *
+ * `adopt` (crash recovery ONLY): when true, a managed destination that exists
+ * but has no recorded prior hash is OVERWRITTEN from source and enrolled
+ * (written) instead of being preserved. This is scoped to resuming an
+ * interrupted deploy (the .lifeos-deploy-inprogress marker was present at
+ * startup): managed trees are deploy-owned, so an un-enrolled file inside one
+ * can only be debris a crashed run left behind — most dangerously a file copied
+ * raw before the step-8 path-rewrite, which normal preserve semantics would
+ * strand with hard-coded ~/.claude paths. Re-adopting it lets the rewrite/token
+ * passes re-process it. Normal (non-resume) runs pass adopt=false and behave
+ * byte-identically to before.
  */
 function syncManagedTree(
   src: string,
@@ -307,6 +325,7 @@ function syncManagedTree(
   previous: DeployState,
   nextFiles: Record<string, string>,
   seen: Set<string>,
+  adopt = false,
 ): SyncResult {
   const result: SyncResult = { copied: 0, updated: 0, preserved: 0, failures: [], written: [] };
   const engineSkip = new Set(["node_modules", ".git", "MEMORY"]);
@@ -340,6 +359,16 @@ function syncManagedTree(
       if (destinationStat.isFile() && priorHash && hashFile(d) === priorHash) {
         cpSync(s, d);
         result.updated++;
+        result.written.push(d);
+        return;
+      }
+
+      // Crash-recovery: re-adopt an un-enrolled managed file left by a crashed
+      // run (see the `adopt` note above). Only for regular files; symlinks/dirs
+      // are never adopted.
+      if (adopt && destinationStat.isFile() && !priorHash) {
+        cpSync(s, d);
+        result.copied++;
         result.written.push(d);
         return;
       }
@@ -687,8 +716,8 @@ function planDryRun(version: string): void {
 
   // 12 deps
   const pkgExists = existsSync(join(CR, "package.json"));
-  log(` 12. deps           copy install/package.json → package.json (${pkgExists ? "exists — skip" : "would copy"}) ; bun install (skipped in dry-run)`);
-  row("12 deps", pkgExists ? "skip" : "copy");
+  log(` 12. deps           hash-manage install/package.json → package.json (${pkgExists ? "present — refresh if unmodified, else preserve" : "would write"}) ; bun install (skipped in dry-run)`);
+  row("12 deps", pkgExists ? "manage" : "write");
 
   log("");
   printSummary();
@@ -700,6 +729,11 @@ function applyDeploy(version: string, bunBin: string, bunDir: string): void {
   log("APPLYING:");
   log("");
   const previous = loadDeployState();
+  // A marker already on disk means a prior --apply died before persisting state.
+  // Detect it BEFORE writing our own marker, then re-adopt any raw files it left.
+  const resuming = existsSync(INPROGRESS_PATH);
+  writeFileSync(INPROGRESS_PATH, new Date().toISOString() + "\n");
+  if (resuming) log("  (resuming an interrupted deploy — re-adopting un-enrolled managed files)");
   const nextFiles = { ...previous.files };
   const seen = new Set<string>();
   const pathRewriteFiles: string[] = [];
@@ -708,9 +742,33 @@ function applyDeploy(version: string, bunBin: string, bunDir: string): void {
 
   // 1. skills + loader symlink
   {
-    const result = syncManagedTree(join(PAYLOAD, "skills"), join(CR, "skills"), previous, nextFiles, seen);
-    failOnCopyErrors("skills synchronization", result.failures);
-    managedWritten.push(...result.written);
+    // Sync every top-level skills/ entry EXCEPT "LifeOS". The LifeOS skill is a
+    // loader SYMLINK (skills/LifeOS → ../LifeOS, i.e. the live repo-root LifeOS/
+    // SKILL.md), created below. Copying install/skills/LifeOS/ here would both
+    // win the lstat race so the symlink branch never runs AND deploy a stale
+    // committed snapshot instead of the live skill — so it is excluded from the
+    // sync, letting the symlink be the sole skills/LifeOS.
+    let copied = 0, updated = 0, preserved = 0;
+    const fails: string[] = [];
+    for (const e of readdirSync(join(PAYLOAD, "skills"), { withFileTypes: true })) {
+      if (e.name === "LifeOS") continue;
+      if (!(e.isDirectory() || e.isFile())) continue;
+      const r = syncManagedTree(join(PAYLOAD, "skills", e.name), join(CR, "skills", e.name), previous, nextFiles, seen, resuming);
+      copied += r.copied;
+      updated += r.updated;
+      preserved += r.preserved;
+      fails.push(...r.failures);
+      managedWritten.push(...r.written);
+      // Deployed skills carry hard-coded ~/.claude paths and bare ../…/LIFEOS
+      // imports (skill tools import ../../../LIFEOS/TOOLS/Inference.ts, etc.), so
+      // they MUST get the step-8 path-rewrite like runtime/hooks. They are NOT
+      // added to tokenFiles: deployable skills contain no deploy-time tokens
+      // ({{HOME}}/{{BUN}}/{{USER_DIR}}/…); the only {{…}} in skills are authoring
+      // placeholders in docs (CreateCLI's {{CLI_NAME}} tutorial, ISA's {{VERSION}}
+      // footer example) that deploy-time substitution would corrupt.
+      pathRewriteFiles.push(...r.written);
+    }
+    failOnCopyErrors("skills synchronization", fails);
     let linkNote = "";
     const link = join(CR, "skills", "LifeOS");
     let linkEntryExists = false;
@@ -727,8 +785,8 @@ function applyDeploy(version: string, bunBin: string, bunDir: string): void {
     } else {
       linkNote = "skills/LifeOS exists";
     }
-    log(`  1. skills         copied ${result.copied}, updated ${result.updated}, preserved ${result.preserved}; ${linkNote}`);
-    row("1 skills", result.copied, result.preserved, result.updated, linkNote);
+    log(`  1. skills         copied ${copied}, updated ${updated}, preserved ${preserved}; ${linkNote}`);
+    row("1 skills", copied, preserved, updated, linkNote);
   }
 
   // 2. runtime (per top-level entry, minus USER/MEMORY/node_modules/.git)
@@ -738,7 +796,7 @@ function applyDeploy(version: string, bunBin: string, bunDir: string): void {
     const fails: string[] = [];
     for (const e of readdirSync(join(PAYLOAD, "LIFEOS"), { withFileTypes: true })) {
       if (runtimeSkip.has(e.name)) continue;
-      const r = syncManagedTree(join(PAYLOAD, "LIFEOS", e.name), join(RT, e.name), previous, nextFiles, seen);
+      const r = syncManagedTree(join(PAYLOAD, "LIFEOS", e.name), join(RT, e.name), previous, nextFiles, seen, resuming);
       copied += r.copied;
       updated += r.updated;
       preserved += r.preserved;
@@ -769,7 +827,7 @@ function applyDeploy(version: string, bunBin: string, bunDir: string): void {
 
   // 4. hooks
   {
-    const result = syncManagedTree(join(PAYLOAD, "hooks"), join(CR, "hooks"), previous, nextFiles, seen);
+    const result = syncManagedTree(join(PAYLOAD, "hooks"), join(CR, "hooks"), previous, nextFiles, seen, resuming);
     failOnCopyErrors("hooks synchronization", result.failures);
     managedWritten.push(...result.written);
     pathRewriteFiles.push(...result.written);
@@ -780,11 +838,13 @@ function applyDeploy(version: string, bunBin: string, bunDir: string): void {
 
   // 5. agents + commands
   {
-    const a = syncManagedTree(join(PAYLOAD, "agents"), join(CR, "agents"), previous, nextFiles, seen);
-    const c = syncManagedTree(join(PAYLOAD, "commands"), join(CR, "commands"), previous, nextFiles, seen);
+    const a = syncManagedTree(join(PAYLOAD, "agents"), join(CR, "agents"), previous, nextFiles, seen, resuming);
+    const c = syncManagedTree(join(PAYLOAD, "commands"), join(CR, "commands"), previous, nextFiles, seen, resuming);
     failOnCopyErrors("agents synchronization", a.failures);
     failOnCopyErrors("commands synchronization", c.failures);
     managedWritten.push(...a.written, ...c.written);
+    // agents/commands carry hard-coded ~/.claude paths too → step-8 path-rewrite.
+    pathRewriteFiles.push(...a.written, ...c.written);
     tokenFiles.push(...a.written, ...c.written);
     log(`  5. agents         copied ${a.copied}, updated ${a.updated}, preserved ${a.preserved}; commands copied ${c.copied}, updated ${c.updated}, preserved ${c.preserved}`);
     row("5 agents", a.copied, a.preserved, a.updated);
@@ -875,18 +935,31 @@ function applyDeploy(version: string, bunBin: string, bunDir: string): void {
     row("11 USER symlink", res.action, "", "", "contract OK");
   }
 
-  // 12. deps
+  // 12. deps — package.json is hash-managed exactly like settings.json (step 6),
+  //     NOT copy-if-missing: absent → write from payload + enroll; unchanged
+  //     since the last deploy → refresh from payload (so an upstream dependency
+  //     bump is picked up before bun install); locally modified or pre-existing
+  //     → preserve. Then bun install against the resulting manifest.
   {
     const pkgSrc = join(PAYLOAD, "package.json");
     const pkgDst = join(CR, "package.json");
     assertSafeDestination(pkgDst);
-    let copied = 0;
+    const key = relativeKey(pkgDst);
+    seen.add(key);
+    let note: string;
     if (!existsSync(pkgDst)) {
-      const r = copyMissing(pkgSrc, pkgDst);
-      failOnCopyErrors("dependency manifest copy", r.failures);
-      copied = r.copied;
+      cpSync(pkgSrc, pkgDst);
+      nextFiles[key] = hashFile(pkgDst);
+      note = "written";
+    } else if (previous.files[key] && hashFile(pkgDst) === previous.files[key]) {
+      cpSync(pkgSrc, pkgDst);
+      nextFiles[key] = hashFile(pkgDst);
+      note = "refreshed";
+    } else {
+      delete nextFiles[key];
+      note = "preserved";
     }
-    log(` 12. deps           package.json ${copied ? "copied" : "present"}; running bun install...`);
+    log(` 12. deps           package.json ${note}; running bun install...`);
     const proc = Bun.spawnSync(["bun", "install"], { cwd: CR, stdout: "pipe", stderr: "pipe" });
     if (proc.exitCode !== 0) {
       die(`bun install exited ${proc.exitCode}: ${proc.stderr.toString().trim().split("\n").slice(-3).join(" | ")}`);
@@ -894,7 +967,7 @@ function applyDeploy(version: string, bunBin: string, bunDir: string): void {
     const hasYaml = existsSync(join(CR, "node_modules", "yaml"));
     if (!hasYaml) die(`bun install exited successfully but node_modules/yaml is missing`);
     log(`     bun install    ok (node_modules/yaml present)`);
-    row("12 deps", copied ? "copied" : "present", "", "", `bun install ok`);
+    row("12 deps", note, "", "", `bun install ok`);
   }
 
   // Remove payload files that disappeared upstream only while their deployed
@@ -907,6 +980,9 @@ function applyDeploy(version: string, bunBin: string, bunDir: string): void {
 
   for (const path of managedWritten) nextFiles[relativeKey(path)] = hashFile(path);
   saveDeployState(nextFiles);
+  // State is durable now: the deploy is complete and recoverable. Clear the
+  // crash-recovery breadcrumb so the next --apply is not treated as a resume.
+  rmSync(INPROGRESS_PATH, { force: true });
 
   log("");
   printSummary();

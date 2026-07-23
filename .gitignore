@@ -81,6 +81,7 @@ credentials/
 /package.json
 /bun.lock
 /.lifeos-deploy-state.json
+/.lifeos-deploy-inprogress
 
 # Deploy-adjacent backups (InstallSettings-style timestamped copies, manual fixes)
 /settings.json.backup-*

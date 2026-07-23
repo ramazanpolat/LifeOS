@@ -51,9 +51,11 @@ BUN="$(command -v bun)"
 CPB="$(command -v claude-playbook)"
 REAL_HOME="$HOME"
 
-# Source under test (fixed by the assignment).
-SRC_URL="file:///Users/polat/DEV/LifeOS"
-SRC_BRANCH="claude/playbook-install"
+# Source under test. Defaults target the primary checkout's packaging branch;
+# override with LP_E2E_SOURCE / LP_E2E_BRANCH to test another branch or a
+# throwaway repo (parity with the lifecycle suite's LP_E2E_SOURCE/LP_E2E_BRANCH).
+SRC_URL="${LP_E2E_SOURCE:-file:///Users/polat/DEV/LifeOS}"
+SRC_BRANCH="${LP_E2E_BRANCH:-claude/playbook-install}"
 
 KEEP_PANES="${LP_E2E_KEEP_PANES:-0}"
 KEEP_TMP="${LP_E2E_KEEP_TMP:-0}"
@@ -167,12 +169,21 @@ def sweep(L):
     pats = [re.compile(r"""\$HOME/\.claude(/|["'])"""),
             re.compile(r"""~/\.claude(/|["' ])"""),
             re.compile(r"""homedir\(\)\s*,\s*['"]\.claude""")]
-    roots = [os.path.join(L, 'hooks'), os.path.join(L, 'runtime', 'LIFEOS', 'TOOLS')]
+    # Only rewriteable text files (deploy.ts TEXT_EXT). This deliberately skips
+    # .tsx (the Telos Dashboard/Report Next.js templates ship .tsx client
+    # components that the deployer cannot rewrite and that the user copies out,
+    # not runs in-place), plus images and *.plist.template (unwired launchd).
+    exts = ('.ts', '.js', '.sh', '.json', '.md', '.yaml', '.yml', '.toml', '.txt')
+    # skills/ and agents/ are swept alongside hooks/ and runtime TOOLS: deployed
+    # skill tools and agent prompts must be path-rewritten too (isolation).
+    roots = [os.path.join(L, 'hooks'), os.path.join(L, 'runtime', 'LIFEOS', 'TOOLS'),
+             os.path.join(L, 'skills'), os.path.join(L, 'agents')]
     e = []
     for root in roots:
-        for dp, _, fs in os.walk(root):
+        for dp, dirs, fs in os.walk(root):  # os.walk does not follow the skills/LifeOS symlink
+            if 'node_modules' in dirs: dirs.remove('node_modules')
             for f in fs:
-                if f.endswith('.plist.template'): continue
+                if not f.endswith(exts): continue
                 p = os.path.join(dp, f)
                 try:
                     txt = open(p, encoding='utf-8', errors='replace').read()
@@ -328,7 +339,14 @@ F="$CMD_DIR/03_rewrite_sweep.sh"
 write_case 03_rewrite_sweep >/dev/null <<'CASE'
 set -euo pipefail
 source "$LP_RUN/env.sh"
+# Sweep hooks/, runtime TOOLS/, skills/ and agents/ for stray home-form paths.
 python3 "$CHECKS" sweep "$L"
+# No BARE ../…/LIFEOS/ imports may survive in deployed skill/agent .ts — RrelL
+# must have retargeted every one to ../…/runtime/LIFEOS/ (an isolation breach
+# otherwise: ../…/LIFEOS resolves to the nonexistent <root>/LIFEOS). Match only
+# a ../ chain immediately followed by LIFEOS/ (…/runtime/LIFEOS/ never matches).
+bare="$(grep -rlnE "(\.\./)+LIFEOS/" "$L/skills" "$L/agents" --include='*.ts' 2>/dev/null | wc -l | tr -d ' ' || true)"  # grep exits 1 on 0 matches (pipefail)
+[ "$bare" -eq 0 ] || { echo "bare ../…/LIFEOS/ imports remain in $bare deployed skill/agent .ts file(s)" >&2; grep -rnE "(\.\./)+LIFEOS/" "$L/skills" "$L/agents" --include='*.ts' | head -10 >&2; exit 1; }
 # The two substring guards must survive path-rewrite byte-identical to payload.
 for hk in KittyEnvPersist.hook.ts LoadContext.hook.ts; do
   dep="$(grep -n "includes('/.claude/Agents/')" "$L/hooks/$hk")"
@@ -348,12 +366,20 @@ set -euo pipefail
 source "$LP_RUN/env.sh"
 cd "$L"
 # hooks: a ./-chain importer (PreToolGuard) + a ../LIFEOS importer (IntegrityCheck,
-# rewritten to ../runtime/LIFEOS by RrelL); the patched lib/paths.ts; and two
-# TOOLS files whose PAYLOAD twins import ../../hooks/ (RrelH -> absolute).
-files="hooks/PreToolGuard.hook.ts hooks/IntegrityCheck.hook.ts hooks/lib/paths.ts runtime/LIFEOS/TOOLS/MemoryStatus.ts runtime/LIFEOS/TOOLS/CheckFileBoundary.ts"
+# rewritten to ../runtime/LIFEOS by RrelL); the patched lib/paths.ts; two TOOLS
+# files whose PAYLOAD twins import ../../hooks/ (RrelH -> absolute); and a deployed
+# SKILL tool (AudioEditor/Tools/Analyze.ts) whose payload twin imports
+# ../../../LIFEOS/TOOLS/Inference.ts (RrelL -> ../../../runtime/LIFEOS/), proving
+# skills are path-rewritten AND their runtime imports resolve.
+files="hooks/PreToolGuard.hook.ts hooks/IntegrityCheck.hook.ts hooks/lib/paths.ts runtime/LIFEOS/TOOLS/MemoryStatus.ts runtime/LIFEOS/TOOLS/CheckFileBoundary.ts skills/AudioEditor/Tools/Analyze.ts"
 # Confirm the two TOOLS twins really do carry ../../hooks/ imports in the payload.
 grep -q '\.\./\.\./hooks/' "$PAYLOAD/LIFEOS/TOOLS/MemoryStatus.ts"
 grep -q '\.\./\.\./hooks/' "$PAYLOAD/LIFEOS/TOOLS/CheckFileBoundary.ts"
+# The skill tool's payload twin has a BARE ../../../LIFEOS/ import; the deployed
+# copy must have it retargeted to ../../../runtime/LIFEOS/ (RrelL at skill depth).
+grep -qE "(\.\./){3}LIFEOS/TOOLS/Inference" "$PAYLOAD/skills/AudioEditor/Tools/Analyze.ts"
+grep -qE "(\.\./){3}runtime/LIFEOS/TOOLS/Inference" "$L/skills/AudioEditor/Tools/Analyze.ts" \
+  || { echo "skill tool import not rewritten to ../../../runtime/LIFEOS/" >&2; exit 1; }
 fails=0
 for f in $files; do
   bn="$(basename "$f")"
@@ -408,8 +434,13 @@ set -euo pipefail
 source "$LP_RUN/env.sh"
 n="$(ls -1 "$L/skills" | wc -l | tr -d ' ')"
 test "$n" -ge 50 || { echo "skills entries $n < 50" >&2; exit 1; }
-diff -q "$L/skills/Interview/SKILL.md" "$PAYLOAD/skills/Interview/SKILL.md" >/dev/null \
-  || { echo "Interview/SKILL.md drifted from payload" >&2; exit 1; }
+# Deployed skills are path-localized (case 03/04 cover that rewrite), so the
+# Interview skill is no longer byte-identical to the payload. Assert STRUCTURAL
+# porting fidelity instead — same file tree, nothing dropped/added — plus a
+# non-empty SKILL.md.
+only="$(diff -rq "$PAYLOAD/skills/Interview" "$L/skills/Interview" 2>/dev/null | grep '^Only in' || true)"
+[ -z "$only" ] || { echo "Interview skill tree drifted from payload:" >&2; printf '%s\n' "$only" >&2; exit 1; }
+test -s "$L/skills/Interview/SKILL.md" || { echo "deployed Interview/SKILL.md is empty" >&2; exit 1; }
 ver="$(tr -d '[:space:]' < "$RT/VERSION")"
 pbver="$(grep '^version' "$L/.playbook" | sed -E 's/.*"([^"]+)".*/\1/')"
 [ "$ver" = "$pbver" ] || { echo "VERSION=$ver != .playbook version=$pbver" >&2; exit 1; }
@@ -511,6 +542,7 @@ run_case 10_statusline_exec "$F"
 # MemorySystem/MemoryReviewer/MemoryWriter "missing" (it searched
 # LifeOS/Tools/) and wrote its health log into the payload tree. R6a/R6b now
 # rewrite quoted "LIFEOS/..." segments and separate-arg 'LIFEOS' join args.
+F="$CMD_DIR/11_r6_configroot_lifeos.sh"   # was missing: run_case reused case 10's file
 write_case 11_r6_configroot_lifeos >/dev/null <<'CASE'
 set -euo pipefail
 source "$LP_RUN/env.sh"
@@ -518,7 +550,7 @@ source "$LP_RUN/env.sh"
 hits="$(grep -rE "['\"\`]LIFEOS/" "$L/hooks" "$RT/TOOLS" 2>/dev/null | grep -cv '@LIFEOS' || true)"
 [ "$hits" -eq 0 ] || { echo "R6a regression: $hits quoted LIFEOS/ path string(s) remain" >&2; exit 1; }
 # (b) no separate-arg 'LIFEOS' join args survive
-hits2="$(grep -rE "(join|resolve|pathResolve)\([^)]*['\"]LIFEOS['\"]" "$L/hooks" "$RT/TOOLS" 2>/dev/null | wc -l | tr -d ' ')"
+hits2="$(grep -rE "(join|resolve|pathResolve)\([^)]*['\"]LIFEOS['\"]" "$L/hooks" "$RT/TOOLS" 2>/dev/null | wc -l | tr -d ' ' || true)"  # grep exits 1 on 0 matches (pipefail)
 [ "$hits2" -eq 0 ] || { echo "R6b regression: $hits2 separate-arg 'LIFEOS' join(s) remain" >&2; exit 1; }
 # (c) MemoryHealthCheck finds every required tool/hook file on disk
 out="$(cd "$L" && CLAUDE_CONFIG_DIR="$L" LIFEOS_DIR="$RT" bun "$RT/TOOLS/MemoryHealthCheck.ts" 2>&1 || true)"
@@ -529,6 +561,47 @@ echo "$out" | grep -q 'file-missing' && { echo "MemoryHealthCheck still reports 
 echo "r6-configroot-lifeos OK (0 stragglers, health check clean, payload untouched)"
 CASE
 run_case 11_r6_configroot_lifeos "$F"
+
+# ── 12. skills/LifeOS loader symlink (P1-b) ─────────────────────────────────
+# skills/LifeOS must be a SYMLINK → ../LifeOS (the LIVE repo-root skill), not a
+# copied stale snapshot, and its SKILL.md must resolve through the link.
+F="$CMD_DIR/12_skills_loader_symlink.sh"
+write_case 12_skills_loader_symlink >/dev/null <<'CASE'
+set -euo pipefail
+source "$LP_RUN/env.sh"
+test -L "$L/skills/LifeOS" || { echo "skills/LifeOS is not a symlink" >&2; ls -la "$L/skills/LifeOS" >&2; exit 1; }
+test -f "$L/skills/LifeOS/SKILL.md" || { echo "skills/LifeOS/SKILL.md does not resolve through the link" >&2; exit 1; }
+resolved="$(cd "$L/skills/LifeOS" && pwd -P)"
+want="$(cd "$L/LifeOS" && pwd -P)"        # repo-root payload dir, NOT a copy under skills/
+[ "$resolved" = "$want" ] || { echo "skills/LifeOS resolves to $resolved, want repo-root $want" >&2; exit 1; }
+diff -q "$L/skills/LifeOS/SKILL.md" "$L/LifeOS/SKILL.md" >/dev/null || { echo "skills/LifeOS/SKILL.md is not the live repo-root SKILL.md" >&2; exit 1; }
+echo "skills/LifeOS loader symlink OK (-> $resolved)"
+CASE
+run_case 12_skills_loader_symlink "$F"
+
+# ── 13. package.json is deploy-managed (P2-a) ───────────────────────────────
+# package.json must be hash-enrolled in the deploy state (not copy-if-missing),
+# so an upstream dependency bump refreshes on the next deploy. Light check: the
+# state records package.json and the recorded hash matches the deployed file.
+F="$CMD_DIR/13_package_managed.sh"
+write_case 13_package_managed >/dev/null <<'CASE'
+set -euo pipefail
+source "$LP_RUN/env.sh"
+test -f "$L/package.json" || { echo "deployed package.json missing" >&2; exit 1; }
+python3 - "$L" <<'PY'
+import json, os, sys, hashlib
+L = sys.argv[1]
+st = json.load(open(os.path.join(L, '.lifeos-deploy-state.json')))
+h = st.get('files', {}).get('package.json')
+if not h:
+    print('FAIL: package.json is not enrolled in .lifeos-deploy-state.json'); sys.exit(1)
+disk = hashlib.sha256(open(os.path.join(L, 'package.json'), 'rb').read()).hexdigest()
+if disk != h:
+    print('FAIL: enrolled hash %s != on-disk %s' % (h, disk)); sys.exit(1)
+print('OK: package.json enrolled and hash matches on-disk (%s...)' % h[:12])
+PY
+CASE
+run_case 13_package_managed "$F"
 
 # ════════════════════════════════════════════════════════════════════════════
 echo

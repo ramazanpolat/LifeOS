@@ -24,8 +24,61 @@ if [ -n "$DIRTY" ]; then
   exit 1
 fi
 
+# Preserve the CLI-injected [source] metadata across the pull. The
+# claude-playbook CLI writes source fields (notably `branch = "..."`, plus the
+# install-time repository) into the tracked `.playbook` at install time, so
+# `.playbook` always shows as locally modified. A plain `git pull --ff-only`
+# then REFUSES whenever the incoming commit ALSO touches `.playbook` — e.g. an
+# upstream version bump — with "Your local changes to .playbook would be
+# overwritten by merge". To stay update-safe:
+#   1. save the local [source] section (CLI-owned metadata, never payload),
+#   2. restore `.playbook` to its committed form so the fast-forward is clean,
+#   3. pull (now unobstructed — the upstream version bump lands),
+#   4. re-apply the saved [source] onto the freshly pulled manifest.
+# Pure POSIX sh + awk (no python).
+
+# Capture the local [source] block: from the `[source]` header to the next
+# section header (or EOF).
+SRC_BLOCK=""
+if [ -f .playbook ] && grep -q '^\[source\]' .playbook; then
+  SRC_BLOCK=$(awk '
+    /^\[source\]/ { f=1 }
+    f==1 && /^\[/ && $0 !~ /^\[source\]/ { f=0 }
+    f==1 { print }
+  ' .playbook)
+fi
+
+# reapply_source FILE — strip any existing [source] section from FILE, then
+# re-append the saved SRC_BLOCK (keeps upstream's version + our injected source).
+# A no-op when nothing was injected. Trailing blank lines are trimmed first so
+# repeated updates never accumulate blank lines.
+reapply_source() {
+  _pb="$1"
+  [ -n "$SRC_BLOCK" ] || return 0
+  awk '
+    /^\[source\]/ { skip=1 }
+    skip==1 && /^\[/ && $0 !~ /^\[source\]/ { skip=0 }
+    skip!=1 { print }
+  ' "$_pb" > "$_pb.tmp"
+  awk '{ lines[n++]=$0 } END { last=n; while (last>0 && lines[last-1]=="") last--; for (i=0;i<last;i++) print lines[i] }' "$_pb.tmp" > "$_pb.tmp2"
+  { cat "$_pb.tmp2"; printf '\n'; printf '%s\n' "$SRC_BLOCK"; } > "$_pb"
+  rm -f "$_pb.tmp" "$_pb.tmp2"
+}
+
+# Clean `.playbook` so the fast-forward has no local modification to trip over.
+git checkout -- .playbook 2>/dev/null || true
+
 echo "update-playbook: pulling latest LifeOS playbook (fast-forward only)..."
-git pull --ff-only
+if ! git pull --ff-only; then
+  echo "update-playbook: fast-forward pull failed; restoring injected .playbook metadata and aborting." >&2
+  reapply_source .playbook
+  exit 1
+fi
+
+# Re-apply the CLI-injected [source] onto the pulled manifest (upstream version +
+# our branch/source). If the manifest shape is unexpected the awk strip is a
+# no-op and this degrades to a plain append of the saved block.
+reapply_source .playbook
 
 # Case-insensitive filesystems (macOS/Windows): pulling a commit that removes a
 # case-twin path (e.g. App/ alongside app/) also deletes the surviving file
